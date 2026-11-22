@@ -1,0 +1,280 @@
+import array from std/array
+import test from std/test
+import escape from github.com/kigumi-dev/exp/ansi
+import sty from github.com/kigumi-dev/exp/style
+
+type FxModel = {
+    log String
+    pings Int
+}
+
+type FxMsg =
+    | Got(text: String?)
+    | Ran(status: Int?)
+    | Pinged
+    | Note(c: String)
+    | Stop
+
+pure fn zero() -> FxModel {
+    FxModel {
+        log: ""
+        pings: 0
+    }
+}
+
+pure fn fxStep(m: FxModel, msg: FxMsg) -> Step[FxModel, FxMsg] {
+    match msg {
+        Got(text) -> still(FxModel {
+            ..m
+            log: text || "missing"
+        })
+        Ran(status) -> still(FxModel {
+            ..m
+            log: if status is Some(code) {
+                "${code}"
+            } else {
+                "failed"
+            }
+        })
+        Pinged -> still(FxModel {
+            ..m
+            pings: m.pings + 1
+        })
+        Note(c) -> {
+            let next = FxModel {
+                ..m
+                log: m.log.concat(c)
+            }
+            if c == "a" {
+                return Step {
+                    model: next
+                    cmd: Cmd.Emit(FxMsg.Note("x"))
+                }
+            }
+            still(next)
+        }
+        Stop -> Step {
+            model: m
+            cmd: Cmd.Quit
+        }
+    }
+}
+
+pure fn fxView(m: FxModel) -> Viewed[FxModel, FxMsg] {
+    Viewed {
+        node: Node.Text("log=${m.log} pings=${m.pings}") |> onKeyName("q", FxMsg.Stop)
+        model: m
+    }
+}
+
+pure fn fxSubs(m: FxModel) -> Sourced[FxModel, FxMsg] {
+    Sourced {
+        subs: Sub.NoSub
+        model: m
+    }
+}
+
+fn fxApp(init: escaping pure fn() -> Step[FxModel, FxMsg]) -> App[FxModel, FxMsg] {
+    App {
+        init: init
+        update: fxStep
+        view: fxView
+        subs: fxSubs
+    }
+}
+
+fn fxInputs(items: ...String) -> Array[Bytes] {
+    let mut out = Array.empty[Bytes]()
+    for s in items {
+        out.push(s.toBytes())
+    }
+    out
+}
+
+pure fn pingLater() -> Step[FxModel, FxMsg] {
+    Step {
+        model: zero()
+        cmd: Cmd.After(30, () => FxMsg.Pinged)
+    }
+}
+
+pure fn readConf() -> Step[FxModel, FxMsg] {
+    Step {
+        model: zero()
+        cmd: Cmd.Read("conf", (text: String?) => FxMsg.Got(text))
+    }
+}
+
+pure fn runTrue() -> Step[FxModel, FxMsg] {
+    Step {
+        model: zero()
+        cmd: Cmd.Spawn("true", Array.of[String]("-x"), (status: Int?) => FxMsg.Ran(status))
+    }
+}
+
+pure fn printLine() -> Step[FxModel, FxMsg] {
+    Step {
+        model: zero()
+        cmd: Cmd.Print("done: 7")
+    }
+}
+
+pure fn printTwoLines() -> Step[FxModel, FxMsg] {
+    Step {
+        model: zero()
+        cmd: Cmd.Print("one\ntwo")
+    }
+}
+
+pure fn setTitle() -> Step[FxModel, FxMsg] {
+    Step {
+        model: zero()
+        cmd: Cmd.Title("counter")
+    }
+}
+
+pure fn markBatch() -> Step[FxModel, FxMsg] {
+    Step {
+        model: zero()
+        cmd: Cmd.Batch(Array.of[Cmd[FxMsg]](Cmd.Emit(FxMsg.Note("a")), Cmd.Emit(FxMsg.Note("b"))))
+    }
+}
+
+pure fn markNested() -> Step[FxModel, FxMsg] {
+    Step {
+        model: zero()
+        cmd: Cmd.Batch(Array.of[Cmd[FxMsg]](Cmd.Batch(Array.of[Cmd[FxMsg]](Cmd.Emit(FxMsg.Note("a")), Cmd.Emit(FxMsg.Note("b")))), Cmd.Emit(FxMsg.Note("c"))))
+    }
+}
+
+test "an After command fires once, not on every frame" {
+    let s = script(20, 1, fxInputs("", "", "", "", "q"), 20)
+    let m = runWith(s.clone(), sty.Profile.NoColor, fxApp(pingLater))?
+    test.expectEq(m.pings, 1)?
+}
+
+test "the loop waits for an alarm rather than its idle timeout" {
+    let s = script(20, 1, fxInputs(), 100)
+    s.interruptAfter(2)
+    let m = runWith(s.clone(), sty.Profile.NoColor, fxApp(pingLater))?
+    // 30 to the alarm, then 50 of idle: waiting the idle timeout first would
+    // have spent 50 and delivered the ping a frame late.
+    test.expectEq(s.nowMs(), 80)?
+    test.expectEq(m.pings, 1)?
+}
+
+test "a Read command answers with the file" {
+    let s = script(20, 1, fxInputs("q"), 1)
+    s.withFile("conf", "hello")
+    let m = runWith(s.clone(), sty.Profile.NoColor, fxApp(readConf))?
+    test.expectEq(m.log, "hello")?
+}
+
+test "a Read command answers None when the file is not there" {
+    let s = script(20, 1, fxInputs("q"), 1)
+    let m = runWith(s.clone(), sty.Profile.NoColor, fxApp(readConf))?
+    test.expectEq(m.log, "missing")?
+}
+
+test "a Spawn command runs the program and reports its status" {
+    let s = script(20, 1, fxInputs("q"), 1)
+    s.withStatus(7)
+    let m = runWith(s.clone(), sty.Profile.NoColor, fxApp(runTrue))?
+    test.expectEq(m.log, "7")?
+    test.expectEq(s.execs().get(0) || "", "true -x")?
+}
+
+test "a Spawn command answers None when the program will not run" {
+    let s = script(20, 1, fxInputs("q"), 1)
+    s.failExec()
+    let m = runWith(s.clone(), sty.Profile.NoColor, fxApp(runTrue))?
+    test.expectEq(m.log, "failed")?
+}
+
+test "the screen is cleared after a child program had it" {
+    let s = script(20, 1, fxInputs("q"), 1)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, fxApp(runTrue))?
+    test.expectEq(array.join(&s.writes(), "").contains(escape.clearScreen()), true)?
+}
+
+test "a printed line is written outside the alt screen" {
+    let s = script(20, 1, fxInputs("q"), 1)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, fxApp(printLine))?
+    let w = array.join(&s.writes(), "")
+    test.expectEq(w.contains(escape.exitAltScreen().concat("done: 7\r\n").concat(escape.enterAltScreen())), true)?
+    // The alt screen comes back blank, so the frame has to be drawn again.
+    test.expectEq(w.contains(escape.clearScreen()), true)?
+}
+
+test "a printed line cannot smuggle a second line in" {
+    let s = script(20, 1, fxInputs("q"), 1)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, fxApp(printTwoLines))?
+    test.expectEq(array.join(&s.writes(), "").contains("one two\r\n"), true)?
+}
+
+test "a Title command writes the title" {
+    let s = script(20, 1, fxInputs("q"), 1)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, fxApp(setTitle))?
+    test.expectEq(array.join(&s.writes(), "").contains(escape.setTitle("counter")), true)?
+}
+
+test "a batch runs in order, and what it emits comes after" {
+    let s = script(20, 1, fxInputs("q"), 1)
+    let m = runWith(s.clone(), sty.Profile.NoColor, fxApp(markBatch))?
+    test.expectEq(m.log, "abx")?
+}
+
+test "a batch inside a batch keeps its place in the order" {
+    let s = script(20, 1, fxInputs("q"), 1)
+    let m = runWith(s.clone(), sty.Profile.NoColor, fxApp(markNested))?
+    test.expectEq(m.log, "abcx")?
+}
+
+test "mapCmd lifts what an After will produce" {
+    let child: Cmd[Int] = Cmd.After(5, () => 7)
+    let lifted: Cmd[String] = mapCmd(child, (n: Int) => "n=${n}")
+    let held = if lifted is Cmd.After(ms, tag) {
+        ms == 5 && tag() == "n=7"
+    } else {
+        false
+    }
+    test.expectEq(held, true)?
+}
+
+test "mapCmd lifts what a Read will produce, path and all" {
+    let child: Cmd[Int] = Cmd.Read("conf", (text: String?) => (text || "").len().toInt() || 0)
+    let lifted: Cmd[String] = mapCmd(child, (n: Int) => "len=${n}")
+    let held = if lifted is Cmd.Read(path, tag) {
+        path == "conf" && tag(Some("abcd")) == "len=4" && tag(None) == "len=0"
+    } else {
+        false
+    }
+    test.expectEq(held, true)?
+}
+
+test "mapCmd lifts what a Spawn will produce, program and args and all" {
+    let child: Cmd[Int] = Cmd.Spawn("ed", Array.of[String]("-s"), (status: Int?) => status || -1)
+    let lifted: Cmd[String] = mapCmd(child, (n: Int) => "code=${n}")
+    let held = if lifted is Cmd.Spawn(program, args, tag) {
+        program == "ed" && (args.get(0) || "") == "-s" && tag(Some(2)) == "code=2" && tag(None) == "code=-1"
+    } else {
+        false
+    }
+    test.expectEq(held, true)?
+}
+
+test "mapCmd leaves the commands that carry no message alone" {
+    let printed: Cmd[String] = mapCmd(Cmd.Print("hi"), (n: Int) => "${n}")
+    let titled: Cmd[String] = mapCmd(Cmd.Title("hi"), (n: Int) => "${n}")
+    let held = if printed is Cmd.Print(text) {
+        text == "hi"
+    } else {
+        false
+    }
+    let named = if titled is Cmd.Title(text) {
+        text == "hi"
+    } else {
+        false
+    }
+    test.expectEq(held && named, true)?
+}

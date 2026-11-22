@@ -1,0 +1,112 @@
+import alloc from std/alloc
+
+/// Steps an index around a ring of `n`, wrapping at both ends. `focusStep`
+/// reads its ring off the view; a widget cycling rows of its own supplies the
+/// count itself.
+pub pure fn wrap(at: Int, n: Int, delta: Int) -> Int {
+    if n <= 0 {
+        return 0
+    }
+    ((at + delta) % n + n) % n
+}
+
+/// Every stop of the ring, in view order, each saying whether it holds focus.
+/// This is the one place the ring exists: there is no list in the model and
+/// nothing in the runtime, so nothing can drift from what the view drew.
+///
+/// A `Focus` node is a leaf of its own ring -- the walk counts it without
+/// descending -- so a child module's ring is one stop of its parent's. An
+/// `Inert` subtree offers no stops at all, which is what makes a modal a
+/// focus trap.
+pure fn stops[M](n: &Node[M]) -> Array[Bool] {
+    match n {
+        Text(s) -> Array.empty[Bool]()
+        Column(kids) -> stopsAll(kids)
+        Row(kids) -> stopsAll(kids)
+        Fixed(cells, kid) -> stopsKid(kid)
+        Flex(weight, kid) -> stopsKid(kid)
+        Styled(st, kid) -> stopsKid(kid)
+        Bordered(b, edge, kid) -> stopsKid(kid)
+        OnKey(h, kid) -> stopsKid(kid)
+        OnPaste(h, kid) -> stopsKid(kid)
+        Reserve(names, kid) -> stopsKid(kid)
+        Cursor(dx, dy, kid) -> stopsKid(kid)
+        Focus(on, kid) -> Array.of(on)
+        Inert(kid) -> Array.empty[Bool]()
+    }
+}
+
+pure fn stopsKid[M](kid: &alloc.Box[Node[M]]) -> Array[Bool] {
+    kid.with((n: &Node[M]) => stops(n))
+}
+
+pure fn stopsAll[M](kids: &Array[Node[M]]) -> Array[Bool] {
+    let mut out = Array.empty[Bool]()
+    for i in 0..kids.len() {
+        out.appendAll(kids.with(i, (n: &Node[M]) => stops(n)) || Array.empty[Bool]())
+    }
+    out
+}
+
+/// How many stops the view offers. The count comes from the view, so adding a
+/// field to the form cannot leave the ring one short.
+pub pure fn focusCount[M](n: &Node[M]) -> Int {
+    stops(n).len().toInt() || 0
+}
+
+/// Which stop holds focus, in view order, or None when no stop in the view is
+/// on -- because nothing is focused, or because the model points at a stop the
+/// view no longer offers. Two stops on is the app's bug; the first wins.
+pub pure fn focusAt[M](n: &Node[M]) -> Int? {
+    let ring = stops(n)
+    for i in 0..ring.len() {
+        if ring.get(i) is Some(true) {
+            return Some(i.toInt() || 0)
+        }
+    }
+    None
+}
+
+/// Where focus lands `delta` stops on, wrapping at both ends. Nothing on in
+/// the view means entering the ring from the edge `delta` came from, so a
+/// stale index recovers on the next Tab instead of trapping focus. An empty
+/// ring answers 0.
+pub pure fn focusStep[M](n: &Node[M], delta: Int) -> Int {
+    let ring = stops(n)
+    let count = ring.len().toInt() || 0
+    if count <= 0 {
+        return 0
+    }
+    let mut at = -1
+    for i in 0..ring.len() {
+        if ring.get(i) is Some(true) {
+            at = i.toInt() || 0
+            break
+        }
+    }
+    if at < 0 {
+        return if delta < 0 {
+            count - 1
+        } else {
+            0
+        }
+    }
+    wrap(at, count, delta)
+}
+
+/// `at` if the view still offers a stop there, and the nearest one it does
+/// offer otherwise. For a list that shrank under focus: call it where the
+/// model shrank, so focus moves at once instead of on the next Tab.
+pub pure fn focusClamp[M](n: &Node[M], at: Int) -> Int {
+    let count = focusCount(n)
+    if count <= 0 {
+        return 0
+    }
+    if at < 0 {
+        return 0
+    }
+    if at >= count {
+        return count - 1
+    }
+    at
+}

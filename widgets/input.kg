@@ -1,0 +1,232 @@
+import text from std/text
+import tui from github.com/kigumi-dev/bright-bunny
+import fit from github.com/kigumi-dev/exp/ansi
+import key from github.com/kigumi-dev/exp/ansi
+import sty from github.com/kigumi-dev/exp/style
+import uni from github.com/kigumi-dev/exp/unicode
+
+/// A one-line text field. The caret counts grapheme clusters rather than bytes
+/// or scalars, so it steps over what the reader sees as one character.
+pub type Input = {
+    pub text String
+    pub caret Int
+}
+
+pub type InputMsg =
+    | Put(text: String)
+    | Erase
+    | Delete
+    | Nudge(by: Int)
+    | ToEdge(right: Bool)
+    | Wipe
+
+/// A field holding text, with the caret after it.
+pub pure fn input(s: String) -> Input {
+    Input {
+        text: s.concat("")
+        caret: clusters(&s).len().toInt() || 0
+    }
+}
+
+pub pure fn clusters(s: &String) -> Array[String] {
+    uni.graphemes(s)
+}
+
+/// How many terminal cells the text before the caret takes. Not the caret
+/// index: one cluster can be two cells wide.
+pub pure fn caretCol(i: &Input) -> Int {
+    let cs = clusters(&i.text)
+    let mut w = 0
+    for n in 0..cs.len() {
+        if (n.toInt() || 0) >= i.caret {
+            break
+        }
+        w = w + (cs.with(n, (c: &String) => uni.clusterWidth(c)) || 0)
+    }
+    w
+}
+
+/// Applies one edit. Every edit re-segments the whole line, which is what
+/// keeps a cluster whole: a ZWJ emoji arrives one scalar per key press, and
+/// each scalar has to join the cluster before it rather than become a cell of
+/// its own.
+pub pure fn inputStep(i: Input, msg: InputMsg) -> Input {
+    let cs = clusters(&i.text)
+    let n = cs.len().toInt() || 0
+    let at = clamp(i.caret, n)
+    match msg {
+        Put(t) -> {
+            let head = joinUpTo(&cs, at).concat(t)
+            Input {
+                caret: clusters(&head).len().toInt() || 0
+                text: head.concat(joinFrom(&cs, at))
+            }
+        }
+        Erase -> {
+            if at <= 0 {
+                return i
+            }
+            Input {
+                text: joinUpTo(&cs, at - 1).concat(joinFrom(&cs, at))
+                caret: at - 1
+            }
+        }
+        Delete -> {
+            if at >= n {
+                return i
+            }
+            Input {
+                text: joinUpTo(&cs, at).concat(joinFrom(&cs, at + 1))
+                caret: at
+            }
+        }
+        Nudge(by) -> Input {
+            text: i.text
+            caret: clamp(at + by, n)
+        }
+        ToEdge(right) -> Input {
+            text: i.text
+            caret: if right {
+                n
+            } else {
+                0
+            }
+        }
+        Wipe -> input("")
+    }
+}
+
+pure fn clamp(at: Int, n: Int) -> Int {
+    if at < 0 {
+        return 0
+    }
+    if at > n {
+        return n
+    }
+    at
+}
+
+pure fn joinUpTo(cs: &Array[String], end: Int) -> String {
+    let mut out = ""
+    for n in 0..cs.len() {
+        if (n.toInt() || 0) >= end {
+            break
+        }
+        out = out.concat(cs.with(n, (c: &String) => c.concat("")) || "")
+    }
+    out
+}
+
+pure fn joinFrom(cs: &Array[String], start: Int) -> String {
+    let mut out = ""
+    for n in 0..cs.len() {
+        if (n.toInt() || 0) >= start {
+            out = out.concat(cs.with(n, (c: &String) => c.concat("")) || "")
+        }
+    }
+    out
+}
+
+/// Claims the keys a text field understands and nothing else, so tab and the
+/// app's own shortcuts travel on to whoever bound them.
+pub pure fn inputKey(k: key.Key) -> InputMsg? {
+    if k.alt {
+        return None
+    }
+    if k.ctrl {
+        return match k.code {
+            key.Code.Rune(c) -> if c == 'u' {
+                Some(InputMsg.Wipe)
+            } else {
+                None
+            }
+            _ -> None
+        }
+    }
+    match k.code {
+        key.Code.Rune(c) -> Some(InputMsg.Put(text.fromChar(c)))
+        key.Code.Space -> Some(InputMsg.Put(" "))
+        key.Code.Backspace -> Some(InputMsg.Erase)
+        key.Code.Delete -> Some(InputMsg.Delete)
+        key.Code.Left -> Some(InputMsg.Nudge(-1))
+        key.Code.Right -> Some(InputMsg.Nudge(1))
+        key.Code.Home -> Some(InputMsg.ToEdge(false))
+        key.Code.End -> Some(InputMsg.ToEdge(true))
+        _ -> None
+    }
+}
+
+/// How a field draws in its two states, and what it shows while empty.
+pub type InputLook = {
+    pub placeholder String
+    pub focused sty.Style
+    pub blurred sty.Style
+}
+
+pub pure fn inputLook() -> InputLook {
+    InputLook {
+        placeholder: ""
+        focused: sty.plain()
+        blurred: sty.plain().withDim(true)
+    }
+}
+
+/// The window of the line that is shown when it is wider than `cells`: the
+/// first cluster to draw and how many cells of text precede it. The caret is
+/// always inside the window, which is what makes a long line scroll.
+pure fn window(cs: &Array[String], caret: Int, cells: Int) -> Int {
+    let mut total = 0
+    for n in 0..cs.len() {
+        total = total + (cs.with(n, (c: &String) => uni.clusterWidth(c)) || 0)
+    }
+    if cells <= 0 || total <= cells {
+        return 0
+    }
+    let mut before = 0
+    for n in 0..cs.len() {
+        if (n.toInt() || 0) >= caret {
+            break
+        }
+        before = before + (cs.with(n, (c: &String) => uni.clusterWidth(c)) || 0)
+    }
+    // One cell past the last column is where the caret sits after the final
+    // cluster, so the window has to reach it as well as the text.
+    if before < cells {
+        return 0
+    }
+    before - cells + 1
+}
+
+pure fn cutFrom(cs: &Array[String], skip: Int) -> String {
+    let mut seen = 0
+    let mut out = ""
+    for n in 0..cs.len() {
+        let w = cs.with(n, (c: &String) => uni.clusterWidth(c)) || 0
+        if seen >= skip {
+            out = out.concat(cs.with(n, (c: &String) => c.concat("")) || "")
+        }
+        seen = seen + w
+    }
+    out
+}
+
+/// The field as a view, `cells` wide. The width is an argument because a pure
+/// view cannot ask the layout how much room it was given, and scrolling a long
+/// line to keep the caret visible needs to know.
+pub pure fn inputView(i: &Input, on: Bool, cells: Int, l: &InputLook) -> tui.Node[InputMsg] {
+    let cs = clusters(&i.text)
+    let skip = window(&cs, clamp(i.caret, cs.len().toInt() || 0), cells)
+    let shown = if i.text.len() == 0 && !on {
+        l.placeholder.concat("")
+    } else {
+        cutFrom(&cs, skip)
+    }
+    let paint = if on {
+        l.focused
+    } else {
+        l.blurred
+    }
+    let line: tui.Node[InputMsg] = tui.styled(tui.Node.Text(fit.padRight(&shown, cells)), paint)
+    let body: tui.Node[InputMsg] = tui.cursorAt(line, caretCol(i) - skip, 0)
+    tui.focus(tui.onPaste(tui.onKey(body, inputKey), (t: String) => Some(InputMsg.Put(t))), on)
+}

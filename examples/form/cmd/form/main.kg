@@ -1,0 +1,121 @@
+import os from std/os
+import tui from github.com/kigumi-dev/bright-bunny
+import w from github.com/kigumi-dev/bright-bunny/widgets
+import sty from github.com/kigumi-dev/exp/style
+
+/// How wide each field draws. A pure view cannot ask the layout how much room
+/// it was given, so the width is the app's to declare -- the same number is
+/// handed to `fixed` and to the widget.
+const FIELD = 28
+
+/// Two fields and one ordinal saying which of them holds the keyboard. That
+/// ordinal is the whole of focus: no ids, nothing in the runtime, and no copy
+/// of it anywhere else.
+type Model = {
+    name w.Input
+    host w.Input
+    on Int
+}
+
+type Msg =
+    | Edit(at: Int, m: w.InputMsg)
+    | Ahead
+    | Astern
+    | Leave
+
+pure fn init() -> tui.Step[Model, Msg] {
+    tui.still(Model {
+        name: w.input("")
+        host: w.input("")
+        on: 0
+    })
+}
+
+pure fn update(m: Model, msg: Msg) -> tui.Step[Model, Msg] {
+    match msg {
+        Edit(at, c) -> if at == 0 {
+            tui.still(Model {
+                name: w.inputStep(m.name, c)
+                host: m.host
+                on: m.on
+            })
+        } else {
+            tui.still(Model {
+                name: m.name
+                host: w.inputStep(m.host, c)
+                on: m.on
+            })
+        }
+        // The ring is read off the view, so the form never says how many stops
+        // it has: adding a third field cannot leave a count behind.
+        Ahead -> {
+            let next = tui.focusStep(&layout(&m), 1)
+            tui.still(Model {
+                ..m
+                on: next
+            })
+        }
+        Astern -> {
+            let next = tui.focusStep(&layout(&m), -1)
+            tui.still(Model {
+                ..m
+                on: next
+            })
+        }
+        Leave -> tui.Step {
+            model: m
+            cmd: tui.Cmd.Quit
+        }
+    }
+}
+
+pure fn look(hint: String) -> w.InputLook {
+    w.InputLook {
+        placeholder: hint
+        focused: sty.plain().withFg(sty.black()).withBg(sty.cyan())
+        blurred: sty.plain().withDim(true)
+    }
+}
+
+pure fn field(i: &w.Input, label: String, hint: String, at: Int, on: Bool) -> tui.Node[Msg] {
+    let box: tui.Node[Msg] = tui.mapNode(w.inputView(i, on, FIELD, &look(hint)), (x: w.InputMsg) => Msg.Edit(at, x))
+    tui.row(Array.of[tui.Node[Msg]](tui.fixed(tui.Node.Text(" ${label}"), 7), tui.fixed(box, FIELD), tui.flex(tui.empty[Msg](), 1)))
+}
+
+pure fn layout(m: &Model) -> tui.Node[Msg] {
+    let rows: tui.Node[Msg] = tui.column(Array.of[tui.Node[Msg]](tui.fixed(field(&m.name, "name", "your name", 0, m.on == 0), 1), tui.fixed(tui.empty[Msg](), 1), tui.fixed(field(&m.host, "host", "example.com", 1, m.on == 1), 1), tui.flex(tui.empty[Msg](), 1)))
+    let title: tui.Node[Msg] = tui.styled(tui.Node.Text(" kigumi tui — form "), sty.plain().withFg(sty.black()).withBg(sty.cyan()).withBold(true))
+    let help: tui.Node[Msg] = tui.styled(tui.Node.Text(" tab/shift+tab move   ctrl+u clear   ctrl+c quit "), sty.plain().withDim(true))
+    let screen: tui.Node[Msg] = tui.column(Array.of[tui.Node[Msg]](tui.fixed(title, 1), tui.flex(tui.bordered(rows, sty.rounded(), sty.plain().withFg(sty.blue())), 1), tui.fixed(help, 1)))
+    // Reserve goes directly around the subtree whose keys are being claimed,
+    // under the bindings that claim them. Without it a widget that grabs every
+    // rune would make the app unquittable.
+    screen
+        |> tui.reserve(Array.of[String]("tab", "shift+tab", "ctrl+c"))
+        |> tui.onKeyName("tab", Msg.Ahead)
+        |> tui.onKeyName("shift+tab", Msg.Astern)
+        |> tui.onKeyName("ctrl+c", Msg.Leave)
+}
+
+pure fn view(m: Model) -> tui.Viewed[Model, Msg] {
+    tui.Viewed {
+        node: layout(&m)
+        model: m
+    }
+}
+
+pure fn subs(m: Model) -> tui.Sourced[Model, Msg] {
+    tui.Sourced {
+        subs: tui.Sub.NoSub
+        model: m
+    }
+}
+
+fn main(host: os.Host) -> Void! {
+    let _ = tui.run(host, tui.App {
+        init: init
+        update: update
+        view: view
+        subs: subs
+    })?
+}

@@ -1,0 +1,24 @@
+Module {
+    name: "github.com/kigumi-dev/bright-bunny/widgets"
+    kigumi: "0.1"
+}
+
+Require {
+    name: "github.com/kigumi-dev/bright-bunny"
+    version: "v0.1.0"
+}
+
+Require {
+    name: "github.com/kigumi-dev/exp/ansi"
+    version: "45da357734fb22d9f33517788dbc3ed9f65f6a86"
+}
+
+Require {
+    name: "github.com/kigumi-dev/exp/style"
+    version: "45da357734fb22d9f33517788dbc3ed9f65f6a86"
+}
+
+Require {
+    name: "github.com/kigumi-dev/exp/unicode"
+    version: "45da357734fb22d9f33517788dbc3ed9f65f6a86"
+}

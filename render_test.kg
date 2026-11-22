@@ -1,0 +1,214 @@
+import test from std/test
+import fit from github.com/kigumi-dev/exp/ansi
+import keys from github.com/kigumi-dev/exp/ansi
+import sty from github.com/kigumi-dev/exp/style
+import uni from github.com/kigumi-dev/exp/unicode
+
+type M = | Noop
+
+fn shape(lines: &Array[String], cols: Int, rows: Int) -> Void! {
+    test.expectEq(lines.len(), rows.toUsize() || 0)?
+    for l in lines {
+        test.expectEq(uni.stringWidth(&l), cols)?
+    }
+}
+
+test "text fills the box exactly" {
+    let n: Node[M] = Node.Text("hi")
+    let out = render(&n, 5, 2, sty.Profile.NoColor)
+    shape(&out, 5, 2)?
+    test.expectEq(out.get(0) || "", "hi   ")?
+    test.expectEq(out.get(1) || "", "     ")?
+}
+
+test "text is clipped to the box" {
+    let n: Node[M] = Node.Text("abcdefgh")
+    let out = render(&n, 3, 1, sty.Profile.NoColor)
+    test.expectEq(out.get(0) || "", "abc")?
+}
+
+test "wide characters keep the box square" {
+    let n: Node[M] = Node.Text("あいう")
+    let out = render(&n, 5, 1, sty.Profile.NoColor)
+    shape(&out, 5, 1)?
+    test.expectEq(out.get(0) || "", "あい ")?
+}
+
+test "newlines make rows" {
+    let n: Node[M] = Node.Text("a\nb")
+    let out = render(&n, 2, 3, sty.Profile.NoColor)
+    shape(&out, 2, 3)?
+    test.expectEq(out.get(0) || "", "a ")?
+    test.expectEq(out.get(1) || "", "b ")?
+    test.expectEq(out.get(2) || "", "  ")?
+}
+
+test "column splits the height" {
+    let n: Node[M] = column(Array.of[Node[M]](Node.Text("a"), Node.Text("b")))
+    let out = render(&n, 1, 2, sty.Profile.NoColor)
+    test.expectEq(out.get(0) || "", "a")?
+    test.expectEq(out.get(1) || "", "b")?
+}
+
+test "column gives fixed children their rows" {
+    let n: Node[M] = column(Array.of[Node[M]](fixed(Node.Text("top"), 1), flex(Node.Text("body"), 1)))
+    let out = render(&n, 4, 3, sty.Profile.NoColor)
+    shape(&out, 4, 3)?
+    test.expectEq(out.get(0) || "", "top ")?
+    test.expectEq(out.get(1) || "", "body")?
+}
+
+test "row splits the width" {
+    let n: Node[M] = row(Array.of[Node[M]](Node.Text("ab"), Node.Text("cd")))
+    let out = render(&n, 4, 1, sty.Profile.NoColor)
+    test.expectEq(out.get(0) || "", "abcd")?
+}
+
+test "row honours fixed widths" {
+    let n: Node[M] = row(Array.of[Node[M]](fixed(Node.Text("xy"), 2), flex(Node.Text("rest"), 1)))
+    let out = render(&n, 6, 1, sty.Profile.NoColor)
+    shape(&out, 6, 1)?
+    test.expectEq(out.get(0) || "", "xyrest")?
+}
+
+test "the remainder goes to the flexible child" {
+    let n: Node[M] = row(Array.of[Node[M]](flex(Node.Text("a"), 1), flex(Node.Text("b"), 1), flex(Node.Text("c"), 1)))
+    let out = render(&n, 7, 1, sty.Profile.NoColor)
+    shape(&out, 7, 1)?
+}
+
+test "a zero-sized box renders nothing" {
+    let n: Node[M] = Node.Text("hi")
+    test.expectEq(render(&n, 0, 5, sty.Profile.NoColor).len(), 0)?
+    test.expectEq(render(&n, 5, 0, sty.Profile.NoColor).len(), 0)?
+}
+
+test "nested rows and columns stay rectangular" {
+    let n: Node[M] = column(Array.of[Node[M]](fixed(Node.Text("header"), 1), flex(row(Array.of[Node[M]](flex(Node.Text("left"), 1), flex(Node.Text("right"), 2))), 1)))
+    shape(&render(&n, 11, 4, sty.Profile.NoColor), 11, 4)?
+}
+
+test "a border takes one cell on every side" {
+    let n: Node[M] = bordered(Node.Text("ab"), sty.square(), sty.plain())
+    let out = render(&n, 4, 3, sty.Profile.NoColor)
+    shape(&out, 4, 3)?
+    test.expectEq(out.get(0) || "", "┌──┐")?
+    test.expectEq(out.get(1) || "", "│ab│")?
+    test.expectEq(out.get(2) || "", "└──┘")?
+}
+
+test "a border too small to draw falls back to the child" {
+    let n: Node[M] = bordered(Node.Text("ab"), sty.square(), sty.plain())
+    let out = render(&n, 1, 1, sty.Profile.NoColor)
+    shape(&out, 1, 1)?
+}
+
+test "styling does not change the geometry" {
+    let hot = sty.plain().withFg(sty.red()).withBold(true)
+    let n: Node[M] = styled(Node.Text("ab"), hot)
+    let out = render(&n, 5, 2, sty.Profile.TrueColor)
+    test.expectEq(out.len(), 2)?
+    for l in out {
+        test.expectEq(fit.textWidth(&l), 5)?
+    }
+}
+
+test "styling is dropped under a colourless profile" {
+    let hot = sty.plain().withFg(sty.red())
+    let n: Node[M] = styled(Node.Text("ab"), hot)
+    let out = render(&n, 4, 1, sty.Profile.NoColor)
+    test.expectEq(out.get(0) || "", "ab  ")?
+}
+
+test "a styled border keeps the box rectangular" {
+    let edge = sty.plain().withFg(sty.cyan())
+    let inner: Node[M] = column(Array.of[Node[M]](Node.Text("one"), Node.Text("two")))
+    let n: Node[M] = bordered(styled(inner, sty.plain().withBold(true)), sty.rounded(), edge)
+    let out = render(&n, 9, 4, sty.Profile.Basic16)
+    test.expectEq(out.len(), 4)?
+    for l in out {
+        test.expectEq(fit.textWidth(&l), 9)?
+    }
+}
+
+test "borders nest inside a layout" {
+    let n: Node[M] = row(Array.of[Node[M]](flex(bordered(Node.Text("l"), sty.square(), sty.plain()), 1), flex(bordered(Node.Text("r"), sty.square(), sty.plain()), 1)))
+    let out = render(&n, 8, 3, sty.Profile.NoColor)
+    shape(&out, 8, 3)?
+    test.expectEq(out.get(0) || "", "┌──┐┌──┐")?
+}
+
+test "keys still reach through styles and borders" {
+    let n: Node[M] = bordered(styled(Node.Text("x"), sty.plain()), sty.square(), sty.plain())
+        |> onKeyName("q", M.Noop)
+    let k = keys.plain(keys.Code.Rune('q'))
+    test.expectEq(dispatch(n, k) is Some(_), true)?
+}
+
+test "a box smaller than its child count still shows the first children" {
+    // The remainder used to go entirely to the last child, so the first two
+    // rows were dropped and the third was drawn three rows tall.
+    let n: Node[Int] = column(Array.of[Node[Int]](Node.Text("a"), Node.Text("b"), Node.Text("c")))
+    let lines = render(&n, 1, 2, sty.Profile.NoColor)
+    test.expectEq(lines.len(), 2)?
+    test.expectEq(lines.get(0) || "", "a")?
+    test.expectEq(lines.get(1) || "", "b")?
+}
+
+test "one spare cell goes to the widest claim, not the last child" {
+    let n: Node[Int] = row(Array.of[Node[Int]](flex(Node.Text("aaaa"), 1), flex(Node.Text("bbbb"), 2)))
+    let lines = render(&n, 4, 1, sty.Profile.NoColor)
+    // 4 cells over weights 1 and 2: exact shares are 1.33 and 2.67.
+    test.expectEq(lines.get(0) || "", "abbb")?
+}
+
+test "shares always add up to the whole axis" {
+    let n: Node[Int] = column(Array.of[Node[Int]](flex(Node.Text("a"), 1), flex(Node.Text("b"), 1), flex(Node.Text("c"), 1)))
+    for rows in 1..9 {
+        let lines = render(&n, 1, rows, sty.Profile.NoColor)
+        test.expectEq(lines.len().toInt() || 0, rows)?
+    }
+}
+
+test "a fixed child cannot claim more of the axis than the box has" {
+    let n: Node[Int] = column(Array.of[Node[Int]](fixed(Node.Text("a"), 100), fixed(Node.Text("b"), 1)))
+    let lines = render(&n, 1, 3, sty.Profile.NoColor)
+    test.expectEq(lines.len(), 3)?
+    // The second child is outside the box, so it draws nothing rather than
+    // being laid out past the bottom.
+    test.expectEq(lines.get(0) || "", "a")?
+    test.expectEq(lines.get(2) || "", " ")?
+}
+
+test "a fixed child larger than the box leaves nothing for the rest" {
+    let n: Node[Int] = row(Array.of[Node[Int]](fixed(Node.Text("aaaaaaaaaa"), 10), flex(Node.Text("bbbb"), 1)))
+    test.expectEq(render(&n, 4, 1, sty.Profile.NoColor).get(0) || "", "aaaa")?
+}
+
+test "a control character does not leave the row short" {
+    // A tab measures no cells but the terminal acts on it, so the row would be
+    // one cell short of the width it claims and the next column would shift.
+    let n: Node[Int] = Node.Text("a\tb")
+    let lines = render(&n, 5, 1, sty.Profile.NoColor)
+    test.expectEq(lines.get(0) || "", "a b  ")?
+    test.expectEq(uni.stringWidth(&(lines.get(0) || "")), 5)?
+}
+
+test "carriage return, backspace and bell are neutralised" {
+    let n: Node[Int] = Node.Text("a\rb\u{8}c\u{7}d")
+    test.expectEq(render(&n, 7, 1, sty.Profile.NoColor).get(0) || "", "a b c d")?
+}
+
+test "a newline in text still starts a new row" {
+    let n: Node[Int] = Node.Text("ab\ncd")
+    let lines = render(&n, 2, 2, sty.Profile.NoColor)
+    test.expectEq(lines.get(0) || "", "ab")?
+    test.expectEq(lines.get(1) || "", "cd")?
+}
+
+test "an escape in text is left alone so styles still work" {
+    let n: Node[Int] = Node.Text("\u{1b}[31mred\u{1b}[0m")
+    let line = render(&n, 3, 1, sty.Profile.NoColor).get(0) || ""
+    test.expectEq(line.contains("\u{1b}[31m"), true)?
+    test.expectEq(fit.textWidth(&line), 3)?
+}

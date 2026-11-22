@@ -1,0 +1,241 @@
+import alloc from std/alloc
+import term from github.com/kigumi-dev/exp/term
+
+/// State a scripted backend keeps between calls. It lives in a `Shared` cell
+/// because the backend is a record of closures and each one needs to reach the
+/// same state.
+type Tape = {
+    mut size term.Size
+    mut inputs Array[Bytes]
+    mut at usize
+    mut writes Array[String]
+    mut now i64
+    mut stepMs i64
+    mut workMs i64
+    mut interruptAfter Int
+    mut resizeAfter Int
+    mut pending term.Size
+    mut reads Int
+    mut files Array[Fake]
+    mut execs Array[String]
+    mut status Int
+    mut execFails Bool
+}
+
+/// A file `readFile` can answer with.
+type Fake = {
+    path String
+    text String
+}
+
+/// What a scripted backend raises for a file or a program it was not given.
+@impl(Error)
+type Absent = {
+    what String
+}
+
+fn Absent.message(self) -> String {
+    "the script has no ${self.what}"
+}
+
+/// A scripted terminal. `Script` is itself the backend, so `runWith` takes it
+/// by value; `clone()` hands over a second handle and the methods on either
+/// one report what happened.
+@impl(Backend)
+pub type Script = {
+    tape alloc.Shared[Tape]
+}
+
+/// A script that reports `cols` x `rows` and feeds `inputs`, one chunk per
+/// read, then nothing.
+///
+/// `stepMs` is how long the next chunk takes to arrive. A read that is given a
+/// shorter timeout than that returns empty and leaves the chunk queued, which
+/// is what a real backend does and what lets a test see how long the loop
+/// chose to wait.
+pub fn script(cols: Int, rows: Int, inputs: Array[Bytes], stepMs: i64) -> Script {
+    Script { tape: alloc.Shared.new(Tape {
+        size: term.Size {
+            cols: cols
+            rows: rows
+        }
+        inputs: inputs
+        at: 0
+        writes: Array.empty[String]()
+        now: 0
+        stepMs: stepMs
+        workMs: 0
+        interruptAfter: -1
+        resizeAfter: -1
+        pending: term.Size {
+            cols: cols
+            rows: rows
+        }
+        reads: 0
+        files: Array.empty[Fake]()
+        execs: Array.empty[String]()
+        status: 0
+        execFails: false
+    }) }
+}
+
+/// Makes every frame cost `ms` of the clock on top of waiting for input, which
+/// is how a test models an app too slow to service its own timers.
+pub fn Script.slowFrame(self, ms: i64) {
+    self.tape.withMut((t: &mut Tape) => {
+        t.workMs = ms
+    })
+}
+
+/// Raises an interrupt once `after` reads have happened, which is how a test
+/// stops a loop that would otherwise run forever.
+pub fn Script.interruptAfter(self, after: Int) {
+    self.tape.withMut((t: &mut Tape) => {
+        t.interruptAfter = after
+    })
+}
+
+/// Reports a resize, to the given size, once `after` reads have happened.
+pub fn Script.resizeAfter(self, after: Int, cols: Int, rows: Int) {
+    self.tape.withMut((t: &mut Tape) => {
+        t.resizeAfter = after
+        t.pending = term.Size {
+            cols: cols
+            rows: rows
+        }
+    })
+}
+
+/// A second handle to the same tape, for handing to `runWith` while keeping
+/// this script to ask what the loop did.
+pub fn Script.clone(self) -> Script {
+    Script { tape: self.tape.clone() }
+}
+
+/// Everything the loop has written, in order.
+pub fn Script.writes(self) -> Array[String] {
+    self.tape.with((t: &Tape) => t.writes.cloneWith((s: &String) => s.concat("")))
+}
+
+/// How many times the loop asked for input.
+pub fn Script.reads(self) -> Int {
+    self.tape.with((t: &Tape) => t.reads)
+}
+
+/// Script itself is the backend. `runWith` takes it by value, so pass
+/// `clone()` when the test still needs this handle afterwards.
+pub fn Script.size(self) -> term.Size! {
+    Ok(self.tape.with((t: &Tape) => t.size))
+}
+
+pub fn Script.read(self, timeoutMs: Int) -> Bytes! {
+    Ok(self.tape.withMut((t: &mut Tape) => {
+        t.reads = t.reads + 1
+        let waited = if timeoutMs < t.stepMs {
+            timeoutMs
+        } else {
+            t.stepMs
+        }
+        t.now = t.now + waited + t.workMs
+        if timeoutMs < t.stepMs {
+            return "".toBytes()
+        }
+        let got = if t.at < t.inputs.len() {
+            t.inputs.with(t.at, (b: &Bytes) => b.concat("".toBytes())) || "".toBytes()
+        } else {
+            "".toBytes()
+        }
+        t.at = t.at + 1
+        got
+    }))
+}
+
+pub fn Script.write(self, s: String) -> Void! {
+    self.tape.withMut((t: &mut Tape) => {
+        t.writes.push(s)
+    })
+}
+
+pub fn Script.interrupted(self) -> Bool {
+    self.tape.with((t: &Tape) => t.interruptAfter >= 0 && t.reads >= t.interruptAfter)
+}
+
+pub fn Script.resized(self) -> Bool {
+    self.tape.withMut(
+        (t: &mut Tape) => {
+            let hit = t.resizeAfter >= 0 && t.reads >= t.resizeAfter
+            if hit {
+                // Report it once, and only now does `size()` answer differently:
+                // applying it at `resizeAfter` would mean the loop's very first
+                // `size()` already saw the new size and no test could observe a
+                // change.
+                t.resizeAfter = -1
+                t.size = t.pending
+            }
+            hit
+        },
+    )
+}
+
+pub fn Script.nowMs(self) -> i64 {
+    self.tape.with((t: &Tape) => t.now)
+}
+
+/// Makes `path` readable, answering `text`.
+pub fn Script.withFile(self, path: String, text: String) {
+    self.tape.withMut((t: &mut Tape) => {
+        t.files.push(Fake {
+            path: path
+            text: text
+        })
+    })
+}
+
+/// What `exec` answers. A script that is not told starts at 0.
+pub fn Script.withStatus(self, status: Int) {
+    self.tape.withMut((t: &mut Tape) => {
+        t.status = status
+    })
+}
+
+/// Makes `exec` fail, as it does when the program is not there.
+pub fn Script.failExec(self) {
+    self.tape.withMut((t: &mut Tape) => {
+        t.execFails = true
+    })
+}
+
+/// Every program the loop ran, as `program arg arg`, in order.
+pub fn Script.execs(self) -> Array[String] {
+    self.tape.with((t: &Tape) => t.execs.clone())
+}
+
+pub fn Script.readFile(self, path: String) -> String! {
+    let found = self.tape.with((t: &Tape) => {
+        let mut hit: String? = None
+        for i in 0..t.files.len() {
+            if t.files.with(i, (f: &Fake) => f.path == path) is Some(true) {
+                hit = t.files.with(i, (f: &Fake) => f.text.concat(""))
+            }
+        }
+        hit
+    })
+    if found is Some(text) {
+        return Ok(text)
+    }
+    fail Absent { what: "file ${path}" }
+}
+
+pub fn Script.exec(self, program: String, args: Array[String]) -> Int! {
+    let mut line = program.concat("")
+    for a in args {
+        line = line.concat(" ").concat(a)
+    }
+    self.tape.withMut((t: &mut Tape) => {
+        t.execs.push(line)
+    })
+    if self.tape.with((t: &Tape) => t.execFails) {
+        fail Absent { what: "program ${program}" }
+    }
+    Ok(self.tape.with((t: &Tape) => t.status))
+}

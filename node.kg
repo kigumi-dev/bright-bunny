@@ -1,0 +1,236 @@
+import alloc from std/alloc
+import key from github.com/kigumi-dev/exp/ansi
+import sty from github.com/kigumi-dev/exp/style
+
+/// A view. `M` is the message type of whatever built it, so a child module's
+/// node is lifted into its parent's with `mapNode`.
+pub type Node[M] =
+    | Text(s: String)
+    | Column(kids: Array[Node[M]])
+    | Row(kids: Array[Node[M]])
+    | Fixed(cells: Int, kid: alloc.Box[Node[M]])
+    | Flex(weight: Int, kid: alloc.Box[Node[M]])
+    | Styled(style: sty.Style, kid: alloc.Box[Node[M]])
+    | Bordered(border: sty.Border, edge: sty.Style, kid: alloc.Box[Node[M]])
+    | OnKey(handler: pure fn(key.Key) -> M?, kid: alloc.Box[Node[M]])
+    | OnPaste(handler: pure fn(String) -> M?, kid: alloc.Box[Node[M]])
+    | Focus(on: Bool, kid: alloc.Box[Node[M]])
+    | Inert(kid: alloc.Box[Node[M]])
+    | Reserve(names: Array[String], kid: alloc.Box[Node[M]])
+    | Cursor(dx: Int, dy: Int, kid: alloc.Box[Node[M]])
+
+/// An empty view.
+pub pure fn empty[M]() -> Node[M] {
+    Node.Text("")
+}
+
+/// Stacks children top to bottom.
+pub pure fn column[M](kids: Array[Node[M]]) -> Node[M] {
+    Node.Column(kids)
+}
+
+/// Places children left to right.
+pub pure fn row[M](kids: Array[Node[M]]) -> Node[M] {
+    Node.Row(kids)
+}
+
+/// Gives the child exactly `cells` along the parent's axis. The node comes
+/// first so the call chains with `|>`, as every other wrapper does.
+pub pure fn fixed[M](kid: Node[M], cells: Int) -> Node[M] {
+    Node.Fixed(cells, alloc.Box.new(kid))
+}
+
+/// Gives the child a share of whatever the fixed children left over.
+pub pure fn flex[M](kid: Node[M], weight: Int) -> Node[M] {
+    Node.Flex(weight, alloc.Box.new(kid))
+}
+
+/// Draws the subtree with the style applied to every cell it covers. Each line
+/// carries its own escape run, so a repaint of one row keeps its styling.
+pub pure fn styled[M](kid: Node[M], s: sty.Style) -> Node[M] {
+    Node.Styled(s, alloc.Box.new(kid))
+}
+
+/// Frames the subtree, taking one cell on each side.
+pub pure fn bordered[M](kid: Node[M], b: sty.Border, edge: sty.Style) -> Node[M] {
+    Node.Bordered(b, edge, alloc.Box.new(kid))
+}
+
+/// Runs handler on every key that reaches this subtree. Returning None lets
+/// the key travel on to the next handler. The node comes first so the call
+/// chains with `|>`.
+pub pure fn onKey[M](kid: Node[M], handler: escaping pure fn(key.Key) -> M?) -> Node[M] {
+    Node.OnKey(handler, alloc.Box.new(kid))
+}
+
+/// Runs handler on text pasted into this subtree. Bracketed paste has to be
+/// turned on for the terminal to send it as one event.
+pub pure fn onPaste[M](kid: Node[M], handler: escaping pure fn(String) -> M?) -> Node[M] {
+    Node.OnPaste(handler, alloc.Box.new(kid))
+}
+
+/// Emits msg when one of the named keys is pressed, in the spelling of
+/// `ansi.Key.name` ("ctrl+c", "enter", "q").
+pub pure fn onKeyName[M: Copy](kid: Node[M], name: String, msg: M) -> Node[M] {
+    Node.OnKey((k) => if k.name() == name {
+        Some(msg)
+    } else {
+        None
+    }, alloc.Box.new(kid))
+}
+
+/// One stop of the focus ring. The subtree hears input only while `on`, and
+/// `focusCount` counts it either way, so the ring comes from the view rather
+/// than from a list the app keeps in step by hand.
+pub pure fn focus[M](kid: Node[M], on: Bool) -> Node[M] {
+    Node.Focus(on, alloc.Box.new(kid))
+}
+
+/// A subtree that hears nothing and offers no focus stop. It still draws, so
+/// this is what a modal lays over the rest of the screen.
+pub pure fn inert[M](kid: Node[M]) -> Node[M] {
+    Node.Inert(alloc.Box.new(kid))
+}
+
+/// Keeps the named keys for the handlers around the subtree, in the spelling
+/// of `ansi.Key.name`. A listed key skips the subtree however deep inside it a
+/// handler sits.
+pub pure fn reserve[M](kid: Node[M], names: Array[String]) -> Node[M] {
+    Node.Reserve(names, alloc.Box.new(kid))
+}
+
+/// Asks for the terminal's own cursor, `dx` cells right and `dy` rows down
+/// from this subtree's corner. The offset is local, so a widget places its
+/// caret without knowing where it was laid out. The first one in view order
+/// wins.
+pub pure fn cursorAt[M](kid: Node[M], dx: Int, dy: Int) -> Node[M] {
+    Node.Cursor(dx, dy, alloc.Box.new(kid))
+}
+
+/// Why not `kids.map(...)`: `Array.map` hands the callback a `&Node[A]`, and
+/// `mapNode` needs to consume the node. Consuming the array with `for` binds
+/// each element by value instead (L-181).
+pure fn mapKids[A, B](kids: Array[Node[A]], f: escaping pure fn(A) -> B) -> Array[Node[B]] {
+    let mut out = Array.empty[Node[B]]()
+    for k in kids {
+        out.push(mapNode(k, f))
+    }
+    out
+}
+
+pure fn mapKid[A, B](kid: alloc.Box[Node[A]], f: escaping pure fn(A) -> B) -> alloc.Box[Node[B]] {
+    alloc.Box.new(mapNode(kid.into(), f))
+}
+
+/// Rewrites every message the node can produce. This is how a parent embeds a
+/// child module's view without the child knowing the parent exists.
+pub pure fn mapNode[A, B](n: Node[A], f: escaping pure fn(A) -> B) -> Node[B] {
+    match n {
+        Text(s) -> Node.Text(s)
+        Column(kids) -> Node.Column(mapKids(kids, f))
+        Row(kids) -> Node.Row(mapKids(kids, f))
+        Fixed(cells, kid) -> Node.Fixed(cells, mapKid(kid, f))
+        Flex(weight, kid) -> Node.Flex(weight, mapKid(kid, f))
+        Styled(st, kid) -> Node.Styled(st, mapKid(kid, f))
+        Bordered(b, edge, kid) -> Node.Bordered(b, edge, mapKid(kid, f))
+        OnKey(h, kid) -> Node.OnKey((e) => h(e).map(f), mapKid(kid, f))
+        OnPaste(h, kid) -> Node.OnPaste((t) => h(t).map(f), mapKid(kid, f))
+        Focus(on, kid) -> Node.Focus(on, mapKid(kid, f))
+        Inert(kid) -> Node.Inert(mapKid(kid, f))
+        Reserve(names, kid) -> Node.Reserve(names, mapKid(kid, f))
+        Cursor(dx, dy, kid) -> Node.Cursor(dx, dy, mapKid(kid, f))
+    }
+}
+
+/// The message the first handler that claims k produces, walking the tree
+/// depth first. None when nothing claims it. The node is consumed: a view is
+/// rebuilt from the model for every event, and dropping it afterwards is what
+/// lets the model move again.
+pub pure fn dispatch[M](n: Node[M], k: key.Key) -> M? {
+    match n {
+        Text(_) -> None
+        Column(kids) -> dispatchAll(kids, k)
+        Row(kids) -> dispatchAll(kids, k)
+        Fixed(_, kid) -> dispatchKid(kid, k)
+        Flex(_, kid) -> dispatchKid(kid, k)
+        Styled(_, kid) -> dispatchKid(kid, k)
+        Bordered(_, _, kid) -> dispatchKid(kid, k)
+        OnPaste(_, kid) -> dispatchKid(kid, k)
+        Cursor(_, _, kid) -> dispatchKid(kid, k)
+        Focus(on, kid) -> if on {
+            dispatchKid(kid, k)
+        } else {
+            None
+        }
+        // Pruned rather than searched: no handler under here is even asked, so
+        // an unfocused widget cannot claim a key its own handler would have.
+        Inert(_) -> None
+        Reserve(names, kid) -> if names.contains(k.name()) {
+            None
+        } else {
+            dispatchKid(kid, k)
+        }
+        OnKey(h, kid) -> {
+            if dispatchKid(kid, k) is Some(m) {
+                return Some(m)
+            }
+            h(k)
+        }
+    }
+}
+
+pure fn dispatchKid[M](kid: alloc.Box[Node[M]], k: key.Key) -> M? {
+    dispatch(kid.into(), k)
+}
+
+pure fn dispatchAll[M](kids: Array[Node[M]], k: key.Key) -> M? {
+    for kid in kids {
+        if dispatch(kid, k) is Some(m) {
+            return Some(m)
+        }
+    }
+    None
+}
+
+/// The message the first handler that claims the pasted text produces.
+pub pure fn dispatchPaste[M](n: Node[M], pasted: String) -> M? {
+    match n {
+        Text(_) -> None
+        Column(kids) -> pasteAll(kids, pasted)
+        Row(kids) -> pasteAll(kids, pasted)
+        Fixed(_, kid) -> pasteKid(kid, pasted)
+        Flex(_, kid) -> pasteKid(kid, pasted)
+        Styled(_, kid) -> pasteKid(kid, pasted)
+        Bordered(_, _, kid) -> pasteKid(kid, pasted)
+        OnKey(_, kid) -> pasteKid(kid, pasted)
+        Cursor(_, _, kid) -> pasteKid(kid, pasted)
+        Focus(on, kid) -> if on {
+            pasteKid(kid, pasted)
+        } else {
+            None
+        }
+        Inert(_) -> None
+        // Reserved names are key names and a paste is not a key, so the one
+        // gate that does cover both is `Inert`.
+        Reserve(_, kid) -> pasteKid(kid, pasted)
+        OnPaste(h, kid) -> {
+            if pasteKid(kid, pasted) is Some(m) {
+                return Some(m)
+            }
+            h(pasted)
+        }
+    }
+}
+
+pure fn pasteKid[M](kid: alloc.Box[Node[M]], pasted: String) -> M? {
+    dispatchPaste(kid.into(), pasted)
+}
+
+pure fn pasteAll[M](kids: Array[Node[M]], pasted: String) -> M? {
+    for kid in kids {
+        if dispatchPaste(kid, pasted) is Some(m) {
+            return Some(m)
+        }
+    }
+    None
+}

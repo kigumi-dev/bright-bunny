@@ -1,0 +1,527 @@
+import array from std/array
+import test from std/test
+import sty from github.com/kigumi-dev/exp/style
+
+type Model = {
+    keys Int
+    ticks Int
+    slow Int
+    cols Int
+    rows Int
+}
+
+type Msg =
+    | Pressed
+    | Tick
+    | SlowTick
+    | Resized(cols: Int, rows: Int)
+    | Dropped(text: String)
+    | Leave
+
+pure fn start() -> Step[Model, Msg] {
+    still(Model {
+        keys: 0
+        ticks: 0
+        slow: 0
+        cols: 0
+        rows: 0
+    })
+}
+
+pure fn step(m: Model, msg: Msg) -> Step[Model, Msg] {
+    match msg {
+        Pressed -> still(Model {
+            ..m
+            keys: m.keys + 1
+        })
+        Tick -> still(Model {
+            ..m
+            ticks: m.ticks + 1
+        })
+        SlowTick -> still(Model {
+            ..m
+            slow: m.slow + 1
+        })
+        // Two overrides in one spread hits E819, so they are chained.
+        Resized(c, r) -> still(Model {
+            ..Model {
+                ..m
+                cols: c
+            }
+            rows: r
+        })
+        Dropped(t) -> still(Model {
+            ..m
+            keys: m.keys + (t.len().toInt() || 0)
+        })
+        Leave -> Step {
+            model: m
+            cmd: Cmd.Quit
+        }
+    }
+}
+
+pure fn lookLayout(m: &Model) -> Node[Msg] {
+    Node.Text("k=${m.keys} t=${m.ticks} s=${m.slow} c=${m.cols}x${m.rows}")
+        |> onKeyName("a", Msg.Pressed)
+        |> onKeyName("q", Msg.Leave)
+}
+
+pure fn look(m: Model) -> Viewed[Model, Msg] {
+    Viewed {
+        node: lookLayout(&m)
+        model: m
+    }
+}
+
+pure fn pasteLayout(m: &Model) -> Node[Msg] {
+    Node.Text("k=${m.keys} t=${m.ticks} s=${m.slow} c=${m.cols}x${m.rows}")
+        |> onPaste((t: String) => Some(Msg.Dropped(t)))
+        |> onKeyName("q", Msg.Leave)
+}
+
+pure fn pasteView(m: Model) -> Viewed[Model, Msg] {
+    Viewed {
+        node: pasteLayout(&m)
+        model: m
+    }
+}
+
+pure fn noSubs(m: Model) -> Sourced[Model, Msg] {
+    Sourced {
+        subs: Sub.NoSub
+        model: m
+    }
+}
+
+/// Two tickers at different rates, which is what the single shared clock used
+/// to starve.
+pure fn timerSubs(m: &Model) -> Sub[Msg] {
+    Sub.Subs(Array.of[Sub[Msg]](Sub.Every(10, () => Msg.Tick), Sub.Every(100, () => Msg.SlowTick)))
+}
+
+pure fn twoTimers(m: Model) -> Sourced[Model, Msg] {
+    Sourced {
+        subs: timerSubs(&m)
+        model: m
+    }
+}
+
+pure fn resizeSub(m: Model) -> Sourced[Model, Msg] {
+    Sourced {
+        subs: Sub.OnResize((c: Int, r: Int) => Msg.Resized(c, r))
+        model: m
+    }
+}
+
+fn app(view: escaping pure fn(Model) -> Viewed[Model, Msg], subs: escaping pure fn(Model) -> Sourced[Model, Msg]) -> App[Model, Msg] {
+    App {
+        init: start
+        update: step
+        view: view
+        subs: subs
+    }
+}
+
+fn inputs(items: ...String) -> Array[Bytes] {
+    let mut out = Array.empty[Bytes]()
+    for s in items {
+        out.push(s.toBytes())
+    }
+    out
+}
+
+test "a quit command ends the loop" {
+    let s = script(10, 2, inputs("q"), 1)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, app(look, noSubs))?
+    test.expectEq(s.reads() <= 2, true)?
+}
+
+test "an interrupt ends the loop" {
+    let s = script(10, 2, inputs(), 1)
+    s.interruptAfter(3)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, app(look, noSubs))?
+    test.expectEq(s.reads(), 3)?
+}
+
+test "the first frame is painted before any input is read" {
+    let s = script(40, 1, inputs(), 1)
+    s.interruptAfter(1)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, app(look, noSubs))?
+    let w = array.join(&s.writes(), "")
+    test.expectEq(w.contains("k=0 t=0"), true)?
+}
+
+test "a key press reaches update" {
+    let s = script(40, 1, inputs("a", "a", "q"), 1)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, app(look, noSubs))?
+    let w = array.join(&s.writes(), "")
+    test.expectEq(w.contains("k=2"), true)?
+}
+
+test "only changed lines are written again" {
+    let s = script(40, 1, inputs("", "", "q"), 1)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, app(look, noSubs))?
+    // Three idle reads repaint nothing, so the only text write is the first frame.
+    let mut painted = 0
+    for w in s.writes() {
+        if w.contains("k=0 t=0") {
+            painted = painted + 1
+        }
+    }
+    test.expectEq(painted, 1)?
+}
+
+test "a slow ticker is not starved by a fast one" {
+    let s = script(40, 1, inputs(), 10)
+    s.interruptAfter(30)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, app(look, twoTimers))?
+    let w = array.join(&s.writes(), "")
+    // 30 reads at 10ms each is 300ms. The 10ms ticker reaches at least 25, and
+    // the 100ms one must have fired too: under one shared clock it never did.
+    test.expectEq(w.contains("t=25"), true)?
+    test.expectEq(w.contains("s=1"), true)?
+    test.expectEq(w.contains("s=2"), true)?
+}
+
+test "the size is handed over before the first frame" {
+    let s = script(24, 3, inputs("q"), 1)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, app(look, resizeSub))?
+    // The app has no other way to learn its width: the first frame it draws
+    // already has to know it.
+    test.expectEq(array.join(&s.writes(), "").contains("c=24x3"), true)?
+}
+
+test "resize is delivered to the subscription" {
+    let s = script(40, 3, inputs(), 1)
+    s.resizeAfter(2, 44, 12)
+    s.interruptAfter(6)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, app(look, resizeSub))?
+    let w = array.join(&s.writes(), "")
+    // Before the fix the subscription was never serviced and this stayed 0x0.
+    test.expectEq(w.contains("c=44x12"), true)?
+}
+
+test "a resize clears the screen before repainting" {
+    let s = script(10, 3, inputs(), 1)
+    s.resizeAfter(2, 40, 12)
+    s.interruptAfter(6)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, app(look, noSubs))?
+    let w = array.join(&s.writes(), "")
+    test.expectEq(w.contains("\u{1b}[2J"), true)?
+}
+
+test "the loop never writes when the box has no room" {
+    let s = script(0, 0, inputs(), 1)
+    s.interruptAfter(2)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, app(look, noSubs))?
+    test.expectEq(array.join(&s.writes(), ""), "")?
+}
+
+test "a bracketed paste reaches the app as one message" {
+    let s = script(40, 1, inputs("\u{1b}[200~abcd\u{1b}[201~", "q"), 1)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, app(pasteView, noSubs))?
+    let w = array.join(&s.writes(), "")
+    // Four bytes pasted, counted once: not four key presses.
+    test.expectEq(w.contains("k=4"), true)?
+}
+
+test "a paste split across two reads is still one message" {
+    let s = script(40, 1, inputs("\u{1b}[200~ab", "cd\u{1b}[201~", "q"), 1)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, app(pasteView, noSubs))?
+    let w = array.join(&s.writes(), "")
+    test.expectEq(w.contains("k=4"), true)?
+}
+
+type Chain = {
+    hops Int
+    order String
+}
+
+type ChainMsg =
+    | Hop(left: Int)
+    | Mark(c: String)
+    | Spin
+    | Done
+
+pure fn chainStart() -> Step[Chain, ChainMsg] {
+    still(Chain {
+        hops: 0
+        order: ""
+    })
+}
+
+pure fn chainStep(m: Chain, msg: ChainMsg) -> Step[Chain, ChainMsg] {
+    match msg {
+        Hop(left) -> {
+            let next = Chain {
+                hops: m.hops + 1
+                order: m.order
+            }
+            if left <= 0 {
+                return still(next)
+            }
+            Step {
+                model: next
+                cmd: Cmd.Emit(ChainMsg.Hop(left - 1))
+            }
+        }
+        Mark(c) -> still(Chain {
+            hops: m.hops
+            order: m.order.concat(c)
+        })
+        // Emits itself forever: the cascade can only be stopped by the runtime.
+        Spin -> Step {
+            model: m
+            cmd: Cmd.Emit(ChainMsg.Spin)
+        }
+        Done -> Step {
+            model: m
+            cmd: Cmd.Quit
+        }
+    }
+}
+
+/// Three marks in one batch, each arriving as its own emitted message.
+pure fn batchStart() -> Step[Chain, ChainMsg] {
+    Step {
+        model: Chain {
+            hops: 0
+            order: ""
+        }
+        cmd: Cmd.Batch(Array.of[Cmd[ChainMsg]](Cmd.Emit(ChainMsg.Mark("a")), Cmd.Emit(ChainMsg.Mark("b")), Cmd.Emit(ChainMsg.Mark("c"))))
+    }
+}
+
+pure fn chainView(m: Chain) -> Viewed[Chain, ChainMsg] {
+    let node: Node[ChainMsg] = Node.Text("hops=${m.hops} order=${m.order}")
+        |> onKeyName("h", ChainMsg.Hop(400))
+        |> onKeyName("b", ChainMsg.Mark("-"))
+        |> onKeyName("s", ChainMsg.Spin)
+        |> onKeyName("q", ChainMsg.Done)
+    Viewed {
+        node: node
+        model: m
+    }
+}
+
+pure fn chainSubs(m: Chain) -> Sourced[Chain, ChainMsg] {
+    Sourced {
+        subs: Sub.NoSub
+        model: m
+    }
+}
+
+fn chainApp() -> App[Chain, ChainMsg] {
+    App {
+        init: chainStart
+        update: chainStep
+        view: chainView
+        subs: chainSubs
+    }
+}
+
+test "a long emit cascade runs to the end without recursing" {
+    let s = script(40, 1, inputs("h", "q"), 1)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, chainApp())?
+    let w = array.join(&s.writes(), "")
+    // 401 nested emits used to be 401 stack frames of advance/perform.
+    test.expectEq(w.contains("hops=401"), true)?
+}
+
+test "an emit cycle is refused instead of exhausting the stack" {
+    let s = script(40, 1, inputs("s"), 1)
+    let out = runWith(s.clone(), sty.Profile.NoColor, chainApp())
+    test.expectEq(out is Err(_), true)?
+}
+
+test "a batch runs its children in the order it was given" {
+    let app = App {
+        init: batchStart
+        update: chainStep
+        view: chainView
+        subs: chainSubs
+    }
+    let s = script(40, 1, inputs("q"), 1)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, app)?
+    let w = array.join(&s.writes(), "")
+    test.expectEq(w.contains("order=abc"), true)?
+}
+
+/// The same two intervals as `twoTimers`, in the other order. Keying deadlines
+/// by position handed each subscription the other's deadline here.
+pure fn twoTimersSwappedSubs(m: &Model) -> Sub[Msg] {
+    Sub.Subs(Array.of[Sub[Msg]](Sub.Every(100, () => Msg.SlowTick), Sub.Every(10, () => Msg.Tick)))
+}
+
+pure fn twoTimersSwapped(m: Model) -> Sourced[Model, Msg] {
+    Sourced {
+        subs: twoTimersSwappedSubs(&m)
+        model: m
+    }
+}
+
+/// Swaps the order of two tickers once the fast one has ticked a few times.
+pure fn flipSubs(m: &Model) -> Sub[Msg] {
+    if m.ticks < 5 {
+        return timerSubs(m)
+    }
+    twoTimersSwappedSubs(m)
+}
+
+pure fn flipping(m: Model) -> Sourced[Model, Msg] {
+    Sourced {
+        subs: flipSubs(&m)
+        model: m
+    }
+}
+
+test "the order of the subscription list does not change when timers fire" {
+    let a = script(40, 1, inputs(), 10)
+    a.interruptAfter(30)
+    let _ = runWith(a.clone(), sty.Profile.NoColor, app(look, twoTimers))?
+    let b = script(40, 1, inputs(), 10)
+    b.interruptAfter(30)
+    let _ = runWith(b.clone(), sty.Profile.NoColor, app(look, twoTimersSwapped))?
+    let wa = array.join(&a.writes(), "")
+    let wb = array.join(&b.writes(), "")
+    test.expectEq(wa.contains("s=2"), wb.contains("s=2"))?
+    test.expectEq(wa.contains("t=25"), wb.contains("t=25"))?
+}
+
+test "reordering the subscription list keeps each timer's own deadline" {
+    let s = script(40, 1, inputs(), 10)
+    s.interruptAfter(40)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, app(look, flipping))?
+    let w = array.join(&s.writes(), "")
+    // 38 frames at 10ms is 380ms, so the 100ms ticker is due at 100, 200 and
+    // 300. Under positional identity the swap handed it the fast ticker's
+    // deadline, so it came due at once and fired a fourth time.
+    test.expectEq(w.contains("s=3"), true)?
+    test.expectEq(w.contains("s=4"), false)?
+}
+
+test "the loop waits no longer than the next deadline" {
+    // The next chunk is 10 seconds away, and idleMs is 50ms. A 10ms ticker
+    // means the read must come back after 10ms, so 20 frames take 200ms and
+    // the 100ms ticker fires twice. Waiting the whole 50ms would take 1s and
+    // fire it ten times; waiting for the chunk would take forever.
+    let s = script(40, 1, inputs("q"), 10000)
+    s.interruptAfter(20)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, app(look, twoTimers))?
+    let w = array.join(&s.writes(), "")
+    test.expectEq(s.nowMs() <= 300, true)?
+    test.expectEq(w.contains("s=1"), true)?
+    test.expectEq(w.contains("s=3"), false)?
+}
+
+test "a missed tick is dropped rather than delivered in a burst" {
+    let s = script(40, 1, inputs(), 1)
+    // The app itself takes 35ms a frame while the ticker wants 10ms, so three
+    // ticks come due per frame. One is delivered and the rest are dropped.
+    s.slowFrame(35)
+    s.interruptAfter(10)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, app(look, twoTimers))?
+    let w = array.join(&s.writes(), "")
+    test.expectEq(w.contains("t=9"), true)?
+    test.expectEq(w.contains("t=12"), false)?
+}
+
+test "a deadline stays on its own boundary instead of drifting" {
+    // The frame took 25ms longer than the 10ms interval. Counting from the
+    // deadline keeps the next one on a 10ms boundary; counting from `now`
+    // would put it at 45 and every later tick would inherit the skew.
+    test.expectEq(stepPast(10, 10, 35), 40)?
+    test.expectEq(stepPast(40, 10, 70), 80)?
+    // Not yet due: the next one is simply one period on.
+    test.expectEq(stepPast(100, 10, 95), 110)?
+    // A long stall skips whole periods rather than counting them one by one.
+    test.expectEq(stepPast(0, 10, 10000), 10010)?
+}
+
+test "a timer the app has just added starts from now" {
+    let fresh = schedule(&flatten(&timerSubs(&Model {
+        keys: 0
+        ticks: 0
+        slow: 0
+        cols: 0
+        rows: 0
+    })), &Array.empty[Timer](), 1000)
+    test.expectEq(fresh.len(), 2)?
+    test.expectEq(fresh.get(0) is Some(Timer {
+        ms: 10
+        nth: 0
+        at: 1010
+    }), true)?
+    test.expectEq(fresh.get(1) is Some(Timer {
+        ms: 100
+        nth: 0
+        at: 1100
+    }), true)?
+}
+
+test "two timers with the same interval keep separate deadlines" {
+    let subs: Sub[Msg] = Sub.Subs(Array.of[Sub[Msg]](Sub.Every(10, () => Msg.Tick), Sub.Every(10, () => Msg.SlowTick)))
+    let flat = flatten(&subs)
+    let was = Array.of[Timer](Timer {
+        ms: 10
+        nth: 0
+        at: 500
+    }, Timer {
+        ms: 10
+        nth: 1
+        at: 900
+    })
+    let kept = schedule(&flat, &was, 1000)
+    test.expectEq(kept.get(0) is Some(Timer {
+        ms: 10
+        nth: 0
+        at: 500
+    }), true)?
+    test.expectEq(kept.get(1) is Some(Timer {
+        ms: 10
+        nth: 1
+        at: 900
+    }), true)?
+}
+
+test "the loop hands back the model it ended with" {
+    let s = script(40, 1, inputs("a", "a", "a", "q"), 1)
+    let last = runWith(s.clone(), sty.Profile.NoColor, app(look, noSubs))?
+    test.expectEq(last.keys, 3)?
+}
+
+test "an interrupted loop hands back the model too" {
+    let s = script(40, 1, inputs("a"), 1)
+    s.interruptAfter(3)
+    let last = runWith(s.clone(), sty.Profile.NoColor, app(look, noSubs))?
+    test.expectEq(last.keys, 1)?
+}
+
+pure fn escView(m: Model) -> Viewed[Model, Msg] {
+    let node: Node[Msg] = Node.Text("k=${m.keys} t=${m.ticks} s=${m.slow} c=${m.cols}x${m.rows}")
+        |> onKeyName("esc", Msg.Pressed)
+        |> onKeyName("q", Msg.Leave)
+    Viewed {
+        node: node
+        model: m
+    }
+}
+
+test "a lone escape arrives once the input goes quiet" {
+    // `decode` holds a trailing ESC back in case it begins a sequence, so the
+    // loop has to flush it when the read times out or Escape never arrives.
+    // The interrupt is a net: without the flush the held ESC also swallows the
+    // `q` as alt+q, and the loop would run forever instead of failing.
+    let s = script(40, 1, inputs("\u{1b}", "", "q"), 1)
+    s.interruptAfter(8)
+    let last = runWith(s.clone(), sty.Profile.NoColor, app(escView, noSubs))?
+    test.expectEq(last.keys, 1)?
+}
+
+test "an escape that begins a sequence is not read as the escape key" {
+    let s = script(40, 1, inputs("\u{1b}", "[A", "q"), 1)
+    s.interruptAfter(8)
+    let last = runWith(s.clone(), sty.Profile.NoColor, app(escView, noSubs))?
+    test.expectEq(last.keys, 0)?
+}

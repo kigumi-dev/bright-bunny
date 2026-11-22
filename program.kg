@@ -1,0 +1,743 @@
+import math from std/math
+import os from std/os
+import text from std/text
+import escape from github.com/kigumi-dev/exp/ansi
+import keys from github.com/kigumi-dev/exp/ansi
+import sty from github.com/kigumi-dev/exp/style
+import term from github.com/kigumi-dev/exp/term
+
+/// How long to wait for input when nothing else is pending.
+const idleMs: Int = 50
+
+/// How many messages one event may cascade into. A cycle of `Cmd.Emit` is an
+/// app bug; the bound makes it an error with the terminal restored, rather
+/// than a stack overflow that skips every `drop` and leaves the shell raw.
+const emitBudget: Int = 10000
+
+/// Runs the app on a real terminal until it quits or is interrupted, and
+/// answers the model it ended with, so a view used to choose something can
+/// hand back what was chosen.
+///
+/// The terminal is restored when the loop ends or returns an error, and on
+/// SIGINT. It is not restored if the process is killed outright: `panic` does
+/// not unwind in this language, so neither `defer` nor `drop` runs, and
+/// SIGTERM and SIGHUP are not watched.
+pub fn run[Model, M](host: os.Host, app: App[Model, M]) -> Model! {
+    let tty = term.open()?
+    let signals = host.signals()
+    let interrupt = signals.watch(os.Signal.Interrupt)?
+    let resize = signals.watch(os.Signal.WindowChange)?
+
+    term.write(host, escape.enterAltScreen().concat(escape.hideCursor()).concat(escape.enableBracketedPaste()))?
+    defer restore(host)
+
+    // `tty` must outlive the loop. Discarding it here would drop the resource,
+    // whose `drop` restores the saved termios: raw mode would end and the
+    // terminal would echo every keystroke over the UI. Locals drop after the
+    // `defer`, which is the order we want -- leave the alt screen, then leave
+    // raw mode.
+    let outcome = runWith(live(host), sty.detect(host), app)
+    _ = tty.size()
+    outcome
+}
+
+/// Runs the app against any backend, answering the model it ended with. This
+/// is the whole loop: give it a scripted backend and the behaviour is testable
+/// without a terminal. The backend is taken by value: a value built from a
+/// local borrow cannot be handed back out of `run`, so the caller owns it.
+pub fn runWith[B: Backend, Model, M](b: B, profile: sty.Profile, app: App[Model, M]) -> Model! {
+    let Step {
+        model: initModel
+        cmd: initCmd
+    } = (app.init)()
+    let Outcome {
+        model: firstModel
+        quit: firstQuit
+        alarms: firstAlarms
+        effects: firstEffects
+    } = perform(app, initModel, initCmd, b.nowMs())?
+    let mut quit = firstQuit
+    let mut model = firstModel
+    let mut alarms = firstAlarms
+    let mut fx = firstEffects
+    let mut repaint = false
+
+    let mut size = b.size()?
+    let mut frame = Array.empty[String]()
+    // Where the terminal cursor is, as the terminal has it. It is a property
+    // of the terminal rather than of the app, so the loop is the only place
+    // that can know it, and knowing it is what keeps an idle frame silent.
+    let mut caret = Caret {
+        shown: false
+        col: 0
+        row: 0
+    }
+    let mut pending = "".toBytes()
+    // One deadline per flattened subscription, so a slow ticker is not starved
+    // by a fast one. Seeded before the first read, or that read would wait the
+    // whole idle timeout however short the app's shortest interval is.
+    let Sourced {
+        subs: initialSubs
+        model: afterSubs
+    } = (app.subs)(model)
+    model = afterSubs
+    let mut timers = schedule(&flatten(&initialSubs), &Array.empty[Timer](), b.nowMs())
+
+    // The size is handed over once before the first frame, as bubbletea does
+    // it: an app that lays itself out by the terminal's width has no other way
+    // to learn it, and waiting for the terminal to change is not an answer.
+    if !quit {
+        let Outcome {
+            model: sizedModel
+            quit: sizedQuit
+            alarms: sizedAlarms
+            effects: sizedEffects
+        } = fireResize(app, model, size, b.nowMs())?
+        quit = sizedQuit
+        model = sizedModel
+        alarms.appendAll(sizedAlarms)
+        fx.appendAll(sizedEffects)
+    }
+
+    for !quit {
+        // What the cascade asked for, in the order it asked. Running an effect
+        // can ask for another, so this drains rather than iterates; each round
+        // is consumed whole for the reason `perform` gives.
+        for fx.len() > 0 && !quit {
+            let round = fx
+            fx = Array.empty[Effect[M]]()
+            for e in round {
+                if quit {
+                    continue
+                }
+                match e {
+                    Load(path, tag) -> {
+                        let got = match b.readFile(path) {
+                            Ok(text) -> Some(text)
+                            Err(_) -> None
+                        }
+                        let Outcome {
+                            model: loadedModel
+                            quit: loadedQuit
+                            alarms: loadedAlarms
+                            effects: loadedEffects
+                        } = advance(app, model, tag(got), b.nowMs())?
+                        quit = loadedQuit
+                        model = loadedModel
+                        alarms.appendAll(loadedAlarms)
+                        fx.appendAll(loadedEffects)
+                    }
+                    Launch(program, args, tag) -> {
+                        let got = match b.exec(program, args) {
+                            Ok(status) -> Some(status)
+                            Err(_) -> None
+                        }
+                        // The screen is gone either way: the backend hands it
+                        // over before it finds out whether the program runs.
+                        repaint = true
+                        let Outcome {
+                            model: ranModel
+                            quit: ranQuit
+                            alarms: ranAlarms
+                            effects: ranEffects
+                        } = advance(app, model, tag(got), b.nowMs())?
+                        quit = ranQuit
+                        model = ranModel
+                        alarms.appendAll(ranAlarms)
+                        fx.appendAll(ranEffects)
+                    }
+                    Say(text) -> {
+                        let line = escape.exitAltScreen().concat(tame(&text)).concat("\r\n")
+                        b.write(line.concat(escape.enterAltScreen()).concat(escape.hideCursor()))?
+                        repaint = true
+                    }
+                    Name(text) -> {
+                        b.write(escape.setTitle(text))?
+                    }
+                }
+            }
+        }
+
+        if quit {
+            break
+        }
+
+        if repaint {
+            // A child program or a printed line owned the screen; nothing the
+            // frame cache remembers is on it any more.
+            repaint = false
+            frame = Array.empty[String]()
+            caret = Caret {
+                shown: false
+                col: 0
+                row: 0
+            }
+            b.write(escape.clearScreen())?
+        }
+        let Viewed {
+            node: view
+            model: afterView
+        } = (app.view)(model)
+        model = afterView
+        let Frame {
+            lines: nextFrame
+            wrote: wrote
+        } = paint(&b, &view, &size, frame, profile)?
+        frame = nextFrame
+        caret = place(&b, cursorOf(&view, size.cols, size.rows), caret, wrote)?
+
+        let chunk = b.read(waitMs(&timers, &alarms, b.nowMs()))?
+        // An empty read means the wait ran out. `decode` holds a trailing
+        // partial sequence back for the next read, so a lone `esc` would never
+        // arrive until another byte did; once the input has gone quiet there is
+        // no later byte to wait for.
+        let quiet = chunk.len() == 0
+        pending = pending.concat(chunk)
+        let decoded = if quiet {
+            keys.flush(&pending)
+        } else {
+            keys.decode(&pending)
+        }
+        pending = pending.slice(decoded.used, pending.len()) || "".toBytes()
+
+        for event in decoded.events {
+            if quit {
+                break
+            }
+            let Viewed {
+                node: live
+                model: back
+            } = (app.view)(model)
+            let hit = match event {
+                keys.Event.KeyPress(k) -> dispatch(live, k)
+                keys.Event.Paste(t) -> dispatchPaste(live, t)
+            }
+            if hit is Some(msg) {
+                let Outcome {
+                    model: nextModel
+                    quit: nextQuit
+                    alarms: nextAlarms
+                    effects: nextEffects
+                } = advance(app, back, msg, b.nowMs())?
+                quit = nextQuit
+                model = nextModel
+                alarms.appendAll(nextAlarms)
+                fx.appendAll(nextEffects)
+            } else {
+                model = back
+            }
+        }
+
+        if b.interrupted() {
+            quit = true
+        }
+
+        if !quit && b.resized() {
+            // A failed read keeps the size the loop already had: a momentary
+            // ioctl failure must not redraw the whole screen at some other
+            // size.
+            size = b.size() || size
+            // The old frame no longer describes the screen.
+            frame = Array.empty[String]()
+            b.write(escape.clearScreen())?
+            let Outcome {
+                model: grownModel
+                quit: grownQuit
+                alarms: grownAlarms
+                effects: grownEffects
+            } = fireResize(app, model, size, b.nowMs())?
+            quit = grownQuit
+            model = grownModel
+            alarms.appendAll(grownAlarms)
+            fx.appendAll(grownEffects)
+        }
+
+        if !quit {
+            let Fired {
+                model: tickedModel
+                quit: tickedQuit
+                timers: nextTimers
+                alarms: tickedAlarms
+                effects: tickedEffects
+            } = fireTimers(app, model, b.nowMs(), timers)?
+            quit = tickedQuit
+            timers = nextTimers
+            model = tickedModel
+            alarms.appendAll(tickedAlarms)
+            fx.appendAll(tickedEffects)
+        }
+
+        if !quit {
+            let Outcome {
+                model: rungModel
+                quit: rungQuit
+                alarms: keptAlarms
+                effects: rungEffects
+            } = fireAlarms(app, model, b.nowMs(), alarms)?
+            quit = rungQuit
+            model = rungModel
+            alarms = keptAlarms
+            fx.appendAll(rungEffects)
+        }
+    }
+    Ok(model)
+}
+
+fn restore(host: os.Host) {
+    let tail = escape.disableBracketedPaste().concat(escape.showCursor()).concat(escape.exitAltScreen())
+    let _ = term.write(host, tail)
+}
+
+/// Hands the new size to every `OnResize` subscription.
+fn fireResize[Model, M](app: App[Model, M], model: Model, size: term.Size, now: i64) -> Outcome[Model, M]! {
+    let Sourced {
+        subs: raw
+        model: held
+    } = (app.subs)(model)
+    let subs = flatten(&raw)
+    let mut acc = held
+    let mut stop = false
+    let mut alarms = Array.empty[Alarm[M]]()
+    let mut effects = Array.empty[Effect[M]]()
+    for s in subs {
+        if stop {
+            break
+        }
+        if s is Sub.OnResize(tag) {
+            let Outcome {
+                model: nextModel
+                quit: nextStop
+                alarms: nextAlarms
+                effects: nextEffects
+            } = advance(app, acc, tag(size.cols, size.rows), now)?
+            stop = nextStop
+            acc = nextModel
+            alarms.appendAll(nextAlarms)
+            effects.appendAll(nextEffects)
+        }
+    }
+    Ok(Outcome {
+        model: acc
+        quit: stop
+        alarms: alarms
+        effects: effects
+    })
+}
+
+/// Fires the one-shot `After` commands whose deadline has passed, dropping
+/// each as it fires. The ones still waiting come back out, along with any the
+/// app asked for while being told.
+fn fireAlarms[Model, M](app: App[Model, M], model: Model, now: i64, was: Array[Alarm[M]]) -> Outcome[Model, M]! {
+    let mut keep = Array.empty[Alarm[M]]()
+    let mut acc = model
+    let mut stop = false
+    let mut effects = Array.empty[Effect[M]]()
+    for a in was {
+        match a {
+            At(at, tag) -> {
+                if stop || now < at {
+                    keep.push(Alarm.At(at, tag))
+                } else {
+                    let Outcome {
+                        model: nextModel
+                        quit: nextStop
+                        alarms: nextAlarms
+                        effects: nextEffects
+                    } = advance(app, acc, tag(), now)?
+                    stop = nextStop
+                    acc = nextModel
+                    keep.appendAll(nextAlarms)
+                    effects.appendAll(nextEffects)
+                }
+            }
+        }
+    }
+    Ok(Outcome {
+        model: acc
+        quit: stop
+        alarms: keep
+        effects: effects
+    })
+}
+
+/// One subscription's next deadline, in the clock's own milliseconds.
+///
+/// Identity is the interval plus the ordinal among subscriptions sharing that
+/// interval, not the position in the list. Keying by position hands a timer
+/// another timer's deadline whenever the app reorders a same-length list, and
+/// a 100-second timer inheriting a 10-millisecond deadline fires a thousand
+/// times over.
+type Timer = {
+    ms i64
+    nth Int
+    at i64
+}
+
+/// What `fireTimers` carries back out.
+type Fired[Model, M] = {
+    model Model
+    quit Bool
+    timers Array[Timer]
+    alarms Array[Alarm[M]]
+    effects Array[Effect[M]]
+}
+
+/// Fires the `Every` subscriptions whose deadline has passed, each on its own
+/// schedule.
+///
+/// A tick that the loop was too slow to deliver is dropped rather than
+/// delivered late in a burst, but the phase is kept: the next deadline counts
+/// from the one that was missed, so a 10 ms ticker stays on 10 ms boundaries
+/// instead of drifting by however long each frame took.
+fn fireTimers[Model, M](app: App[Model, M], model: Model, now: i64, was: Array[Timer]) -> Fired[Model, M]! {
+    let Sourced {
+        subs: raw
+        model: held
+    } = (app.subs)(model)
+    let subs = flatten(&raw)
+    let mut timers = schedule(&subs, &was, now)
+    let mut acc = held
+    let mut stop = false
+    let mut alarms = Array.empty[Alarm[M]]()
+    let mut effects = Array.empty[Effect[M]]()
+    let mut i: usize = 0
+    for s in subs {
+        if stop {
+            break
+        }
+        let t = timers.get(i) || Timer {
+            ms: 0
+            nth: 0
+            at: 0
+        }
+        if t.ms > 0 && now >= t.at {
+            if s is Sub.Every(ms, tag) {
+                let Outcome {
+                    model: nextModel
+                    quit: nextStop
+                    alarms: nextAlarms
+                    effects: nextEffects
+                } = advance(app, acc, tag(), now)?
+                stop = nextStop
+                acc = nextModel
+                alarms.appendAll(nextAlarms)
+                effects.appendAll(nextEffects)
+            }
+            let next = stepPast(t.at, t.ms, now)
+            let _ = timers.withMut(i, (x: &mut Timer) => {
+                x = Timer {
+                    ms: t.ms
+                    nth: t.nth
+                    at: next
+                }
+            })
+        }
+        i = i + 1
+    }
+    Ok(Fired {
+        model: acc
+        quit: stop
+        timers: timers
+        alarms: alarms
+        effects: effects
+    })
+}
+
+/// The first deadline after `now`, counting whole periods from `at`. Falls back
+/// to `now + ms` if the clock jumped far enough that counting would spin.
+pure fn stepPast(at: i64, ms: i64, now: i64) -> i64 {
+    if ms <= 0 {
+        return now
+    }
+    let behind = now - at
+    if behind < 0 {
+        return at + ms
+    }
+    at + ms * (behind / ms + 1)
+}
+
+/// A deadline for every subscription, carrying over the one each subscription
+/// already had. A subscription the app has just added starts from `now`; one it
+/// has dropped takes its deadline with it.
+pure fn schedule[M](subs: &Array[Sub[M]], was: &Array[Timer], now: i64) -> Array[Timer] {
+    let mut out = Array.empty[Timer]()
+    let mut seen = Array.empty[i64]()
+    for i in 0..subs.len() {
+        let ms = subs.with(i, (s: &Sub[M]) => everyMs(s)) || 0
+        let mut nth = 0
+        for j in 0..seen.len() {
+            if (seen.get(j) || -1) == ms {
+                nth = nth + 1
+            }
+        }
+        seen.push(ms)
+        out.push(Timer {
+            ms: ms
+            nth: nth
+            at: carried(was, ms, nth) || (now + ms)
+        })
+    }
+    out
+}
+
+pure fn carried(was: &Array[Timer], ms: i64, nth: Int) -> i64? {
+    for i in 0..was.len() {
+        if was.with(i, (t: &Timer) => t.ms == ms && t.nth == nth) is Some(true) {
+            return was.with(i, (t: &Timer) => t.at)
+        }
+    }
+    None
+}
+
+/// How long the loop may wait for input before a timer or an alarm needs
+/// servicing.
+pure fn waitMs[M](timers: &Array[Timer], alarms: &Array[Alarm[M]], now: i64) -> Int {
+    let mut wait = idleMs
+    for i in 0..timers.len() {
+        let left = leftOn(timers, i, now)
+        if left is Some(ms) && ms < wait {
+            wait = ms
+        }
+    }
+    for i in 0..alarms.len() {
+        let left = alarms.with(i, (a: &Alarm[M]) => alarmLeft(a, now)) || wait
+        if left < wait {
+            wait = left
+        }
+    }
+    math.max(0, wait)
+}
+
+pure fn alarmLeft[M](a: &Alarm[M], now: i64) -> Int {
+    match a {
+        At(at, tag) -> at - now
+    }
+}
+
+pure fn leftOn(timers: &Array[Timer], i: usize, now: i64) -> Int? {
+    if timers.with(i, (t: &Timer) => t.ms > 0) is Some(true) {
+        let at = timers.with(i, (t: &Timer) => t.at) || now
+        return Some(at - now)
+    }
+    None
+}
+
+pure fn everyMs[M](s: &Sub[M]) -> i64 {
+    if s is Sub.Every(ms, tag) {
+        return ms
+    }
+    0
+}
+
+/// A one-shot `Cmd.After` the loop is holding until its deadline. An ADT
+/// rather than a record because the tag is a closure, which a record field
+/// cannot hold (`E413`).
+type Alarm[M] = | At(at: i64, tag: pure fn() -> M)
+
+/// An effect the loop has to run for the app, collected rather than performed
+/// where it was found.
+///
+/// Why collected: a function that takes the backend and gives back a model is
+/// read as returning a borrow of it (`E2160`), so the model could never leave
+/// `perform` again. The cascade stays free of the backend and the loop, which
+/// owns it, performs what the cascade asked for.
+type Effect[M] =
+    | Load(path: String, tag: pure fn(String?) -> M)
+    | Launch(program: String, args: Array[String], tag: pure fn(Int?) -> M)
+    | Say(text: String)
+    | Name(text: String)
+
+/// The outcome of feeding one message through the app: the model, whether it
+/// asked to stop, the one-shot alarms it now owes, and the effects the loop
+/// has to run.
+type Outcome[Model, M] = {
+    model Model
+    quit Bool
+    alarms Array[Alarm[M]]
+    effects Array[Effect[M]]
+}
+
+/// Raised when a `Cmd.Emit` cascade passes `emitBudget`.
+@impl(Error)
+type Runaway = {
+    spent Int
+}
+
+fn Runaway.message(self) -> String {
+    "update emitted ${self.spent} messages without settling: Cmd.Emit is in a cycle"
+}
+
+fn advance[Model, M](app: App[Model, M], model: Model, msg: M, now: i64) -> Outcome[Model, M]! {
+    let step = (app.update)(model, msg)
+    perform(app, step.model, step.cmd, now)
+}
+
+/// Expands a command into the flat list the cascade runs, in order. Only
+/// `Batch` expands; the depth is the nesting the app wrote, not the length of
+/// any cascade, so recursing here cannot run away.
+pure fn flatCmd[M](cmd: Cmd[M]) -> Array[Cmd[M]] {
+    match cmd {
+        Batch(cs) -> flatMany(cs)
+        other -> Array.of(other)
+    }
+}
+
+pure fn flatMany[M](cs: Array[Cmd[M]]) -> Array[Cmd[M]] {
+    let mut out = Array.empty[Cmd[M]]()
+    for c in cs {
+        out.appendAll(flatCmd(c))
+    }
+    out
+}
+
+/// Runs a command, feeding anything it emits straight back through `update`.
+///
+/// Commands run in the order the app asked for them, a whole round at a time:
+/// everything the round was given, then everything that round emitted. A
+/// message emitted by the first of three commands is therefore delivered after
+/// the other two, not between them. Elm and bubbletea make no ordering promise
+/// inside a batch at all, so this is the stronger guarantee of the two.
+///
+/// Why rounds rather than a stack: the cascade carries the app's closures out
+/// in `effects`, and taking those out of a list the function still holds makes
+/// the checker read the result as borrowing that list (`E2160`). Consuming
+/// each round whole leaves nothing to borrow. Recursion is not an option
+/// either -- `Emit` would recurse once per message with no bound.
+fn perform[Model, M](app: App[Model, M], model: Model, cmd: Cmd[M], now: i64) -> Outcome[Model, M]! {
+    // Why the copy: calling `app.update` through the borrow makes the checker read the model
+    // it returns as borrowing `app`, so the loop would not be able to hand it back.
+    let update = app.update
+    let mut acc = model
+    let mut work = flatCmd(cmd)
+    let mut spent = 0
+    let mut alarms = Array.empty[Alarm[M]]()
+    let mut effects = Array.empty[Effect[M]]()
+    let mut stop = false
+    for work.len() > 0 && !stop {
+        let round = work
+        let mut later = Array.empty[Cmd[M]]()
+        for c in round {
+            if stop {
+                continue
+            }
+            match c {
+                NoCmd -> {}
+                Quit -> {
+                    stop = true
+                }
+                Emit(m) -> {
+                    if spent >= emitBudget {
+                        return Err(Runaway { spent: spent })
+                    }
+                    spent = spent + 1
+                    let Step {
+                        model: nextModel
+                        cmd: nextCmd
+                    } = update(acc, m)
+                    later.appendAll(flatCmd(nextCmd))
+                    acc = nextModel
+                }
+                Batch(cs) -> {
+                    later.appendAll(flatMany(cs))
+                }
+                After(ms, tag) -> {
+                    alarms.push(Alarm.At(now + ms, tag))
+                }
+                Read(path, tag) -> {
+                    effects.push(Effect.Load(path, tag))
+                }
+                Spawn(program, args, tag) -> {
+                    effects.push(Effect.Launch(program, args, tag))
+                }
+                Print(text) -> {
+                    effects.push(Effect.Say(text))
+                }
+                Title(text) -> {
+                    effects.push(Effect.Name(text))
+                }
+            }
+        }
+        work = later
+    }
+    Ok(Outcome {
+        model: acc
+        quit: stop
+        alarms: alarms
+        effects: effects
+    })
+}
+
+/// Where the loop last left the terminal's cursor.
+type Caret = {
+    shown Bool
+    col Int
+    row Int
+}
+
+/// Parks the terminal cursor where the view asked for it, or hides it when the
+/// view asked for nothing, and answers where it now is.
+///
+/// Nothing is written unless something changed: a frame that painted has moved
+/// the hardware cursor and has to park it again, but an idle frame leaves it
+/// where it already is, so a still screen is silent.
+fn place[B: Backend](b: &B, spot: Spot?, was: Caret, painted: Bool) -> Caret! {
+    if spot is Some(sp) {
+        let here = was.shown && was.col == sp.col && was.row == sp.row
+        if here && !painted {
+            return Ok(was)
+        }
+        let lead = if was.shown {
+            ""
+        } else {
+            escape.showCursor()
+        }
+        b.write(escape.moveTo(sp.row, sp.col).concat(lead))?
+        return Ok(Caret {
+            shown: true
+            col: sp.col
+            row: sp.row
+        })
+    }
+    if was.shown {
+        b.write(escape.hideCursor())?
+    }
+    Ok(Caret {
+        shown: false
+        col: was.col
+        row: was.row
+    })
+}
+
+/// The lines now on the screen, and whether anything was written to get
+/// there. `place` needs the second half: a repaint leaves the hardware cursor
+/// wherever the last line ended, so the caret has to be parked again -- but
+/// only then.
+type Frame = {
+    lines Array[String]
+    wrote Bool
+}
+
+/// Writes only the lines that changed since the previous frame.
+fn paint[B: Backend, M](b: &B, view: &Node[M], size: &term.Size, prev: Array[String], p: sty.Profile) -> Frame! {
+    let next = render(view, size.cols, size.rows, p)
+    let mut out = text.StringBuilder.new()
+    let mut i: usize = 0
+    for i < next.len() {
+        let line = next.get(i) || ""
+        let was = prev.get(i) || ""
+        if line != was || prev.len() == 0 {
+            out.push(escape.moveTo(i.toInt() || 0, 0))
+            out.push(line)
+        }
+        i = i + 1
+    }
+    let payload = out.freeze()?
+    let wrote = payload.len() > 0
+    if wrote {
+        b.write(payload)?
+    }
+    Ok(Frame {
+        lines: next
+        wrote: wrote
+    })
+}

@@ -1,0 +1,106 @@
+import fs from std/fs
+import os from std/os
+import time from std/time
+import escape from github.com/kigumi-dev/exp/ansi
+import term from github.com/kigumi-dev/exp/term
+
+/// Everything the event loop needs from outside itself. `Live` drives a real
+/// terminal; a test supplies a scripted one, which is the only way to exercise
+/// the loop at all, since FFI does not run under the VM.
+///
+/// This is an interface rather than a record of closures because a record field
+/// cannot hold a closure that captures anything (`E413`), and `escaping` is not
+/// valid in a field type. Implementations keep their state in their own fields.
+pub interface Backend {
+    /// The size of the box the app draws into, in cells. Failing is not fatal
+    /// to a running loop: it keeps the size it last had.
+    fn size(self) -> term.Size!
+
+    /// Whatever bytes have arrived, waiting at most `timeoutMs` for the first
+    /// of them. An empty answer means the wait ran out, not end of input.
+    fn read(self, timeoutMs: Int) -> Bytes!
+
+    fn write(self, s: String) -> Void!
+
+    /// Whether an interrupt has arrived since this was last asked. Asking
+    /// consumes it, so only the loop may call it, and only once a frame.
+    fn interrupted(self) -> Bool
+
+    /// Whether the size has changed since this was last asked. Consuming, like
+    /// `interrupted`.
+    fn resized(self) -> Bool
+
+    /// A monotonic millisecond clock. Part of the capability because
+    /// subscription deadlines are otherwise untestable.
+    fn nowMs(self) -> i64
+
+    /// The whole contents of a file, for `Cmd.Read`.
+    fn readFile(self, path: String) -> String!
+
+    /// Runs a program to completion and answers its exit status, for
+    /// `Cmd.Spawn`. The implementation hands the terminal over first and takes
+    /// it back afterwards, so the child sees a terminal in its usual state.
+    fn exec(self, program: String, args: Array[String]) -> Int!
+}
+
+/// The backend that drives a real terminal. The raw-mode handle stays with the
+/// caller; the size comes from the output descriptor, so this holds no borrow.
+@impl(Backend)
+pub type Live = {
+    host os.Host
+    origin time.Monotonic
+}
+
+/// Builds the live backend. `run` installs the signal watches.
+pub fn live(host: os.Host) -> Live {
+    Live {
+        host: host
+        origin: time.monotonic()
+    }
+}
+
+pub fn Live.size(self) -> term.Size! {
+    term.sizeChecked()
+}
+
+pub fn Live.read(self, timeoutMs: Int) -> Bytes! {
+    term.read(self.host, timeoutMs)
+}
+
+pub fn Live.write(self, s: String) -> Void! {
+    term.write(self.host, s)
+}
+
+/// Only a signal counts, never a keystroke: `term.open` puts the terminal in
+/// raw mode, which clears `ISIG`, so ctrl+c arrives as byte 0x03 and never
+/// raises SIGINT. An app that wants ctrl+c binds it like any other key.
+pub fn Live.interrupted(self) -> Bool {
+    self.host.signals().pending(os.Signal.Interrupt)
+}
+
+pub fn Live.resized(self) -> Bool {
+    self.host.signals().pending(os.Signal.WindowChange)
+}
+
+pub fn Live.nowMs(self) -> i64 {
+    time.monotonic().diffMillis(self.origin)
+}
+
+pub fn Live.readFile(self, path: String) -> String! {
+    self.host.files().read(fs.Path.fromString(path)?)
+}
+
+/// Leaves the alt screen and raw mode, runs the program, then takes both back.
+/// A child that draws (an editor, a pager) needs the normal screen, and one
+/// that does not (a prompt, a compiler) needs line editing and its own ctrl+c,
+/// which raw mode has taken away.
+///
+/// The screen comes back blank, so the loop repaints from scratch afterwards.
+pub fn Live.exec(self, program: String, args: Array[String]) -> Int! {
+    term.write(self.host, escape.showCursor().concat(escape.exitAltScreen()))?
+    term.cooked()?
+    let status = self.host.processes().run(program, args)
+    term.raw()?
+    term.write(self.host, escape.enterAltScreen().concat(escape.hideCursor()))?
+    status
+}

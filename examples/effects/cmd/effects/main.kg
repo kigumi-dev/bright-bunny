@@ -1,0 +1,118 @@
+import os from std/os
+import tui from github.com/kigumi-dev/bright-bunny
+import sty from github.com/kigumi-dev/exp/style
+
+/// Where `s` writes what the child program saw. The child is `stty`, so the
+/// file says whether the terminal was handed over in its usual state.
+const report: String = "/tmp/bright-bunny-stty.txt"
+
+type Model = {
+    log String
+    ticks Int
+}
+
+type Msg =
+    | Loaded(text: String?)
+    | Finished(status: Int?)
+    | Ticked
+    | Ask
+    | Launch
+    | Shout
+    | Leave
+
+pure fn init() -> tui.Step[Model, Msg] {
+    tui.Step {
+        model: Model {
+            log: "ready"
+            ticks: 0
+        }
+        cmd: tui.Cmd.Batch(Array.of[tui.Cmd[Msg]](tui.Cmd.Title("bright-bunny — effects"), tui.Cmd.After(1500, () => Msg.Ticked)))
+    }
+}
+
+pure fn said(m: &Model, what: String) -> Model {
+    Model {
+        log: what
+        ticks: m.ticks
+    }
+}
+
+pure fn update(m: Model, msg: Msg) -> tui.Step[Model, Msg] {
+    match msg {
+        Ask -> tui.Step {
+            model: said(&m, "reading /etc/hostname")
+            cmd: tui.Cmd.Read("/etc/hostname", (text: String?) => Msg.Loaded(text))
+        }
+        Loaded(text) -> tui.still(said(&m, if text is Some(got) {
+            "host: ${firstLine(&got)}"
+        } else {
+            "the file could not be read"
+        }))
+        Launch -> tui.Step {
+            model: said(&m, "running stty")
+            cmd: tui.Cmd.Spawn("/bin/sh", Array.of[String]("-c", "stty -a > ${report}"), (status: Int?) => Msg.Finished(status))
+        }
+        Finished(status) -> tui.still(said(&m, if status is Some(code) {
+            "stty left with ${code}; see ${report}"
+        } else {
+            "the program would not run"
+        }))
+        Shout -> tui.Step {
+            model: said(&m, "printed a line outside the alt screen")
+            cmd: tui.Cmd.Print("bright-bunny was here")
+        }
+        Ticked -> tui.Step {
+            model: Model {
+                log: m.log
+                ticks: m.ticks + 1
+            }
+            cmd: tui.Cmd.After(1500, () => Msg.Ticked)
+        }
+        Leave -> tui.Step {
+            model: m
+            cmd: tui.Cmd.Quit
+        }
+    }
+}
+
+/// `Read` hands over the whole file; a hostname is the first line of it.
+pure fn firstLine(s: &String) -> String {
+    let parts = s.split("\n")
+    parts.get(0) || ""
+}
+
+pure fn view(m: Model) -> tui.Viewed[Model, Msg] {
+    let body: tui.Node[Msg] = tui.column(Array.of[tui.Node[Msg]](tui.Node.Text(""), tui.styled(tui.Node.Text("  ${m.log}"), sty.plain().withBold(true)), tui.Node.Text(""), tui.styled(tui.Node.Text("  After has fired ${m.ticks} time(s)"), sty.plain().withDim(true))))
+    let title: tui.Node[Msg] = tui.styled(tui.Node.Text(" bright-bunny — effects "), sty.plain().withFg(sty.black()).withBg(sty.cyan()).withBold(true))
+    let help: tui.Node[Msg] = tui.styled(tui.Node.Text(" r read   s spawn   p print   q quit "), sty.plain().withDim(true))
+    let screen: tui.Node[Msg] = tui.column(Array.of[tui.Node[Msg]](tui.fixed(title, 1), tui.flex(tui.bordered(body, sty.rounded(), sty.plain().withFg(sty.blue())), 1), tui.fixed(help, 1)))
+    let node: tui.Node[Msg] = screen
+        |> tui.onKeyName("r", Msg.Ask)
+        |> tui.onKeyName("s", Msg.Launch)
+        |> tui.onKeyName("p", Msg.Shout)
+        |> tui.onKeyName("q", Msg.Leave)
+        |> tui.onKeyName("ctrl+c", Msg.Leave)
+    tui.Viewed {
+        node: node
+        model: m
+    }
+}
+
+pure fn subs(m: Model) -> tui.Sourced[Model, Msg] {
+    tui.Sourced {
+        subs: tui.Sub.NoSub
+        model: m
+    }
+}
+
+fn main(host: os.Host) -> Void! {
+    let last = tui.run(host, tui.App {
+        init: init
+        update: update
+        view: view
+        subs: subs
+    })?
+    // `run` gives the model back, so the app's last word can be printed where
+    // the shell will keep it.
+    print "${last.log}"
+}

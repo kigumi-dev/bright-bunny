@@ -1,0 +1,253 @@
+import test from std/test
+import tui from github.com/kigumi-dev/bright-bunny
+import key from github.com/kigumi-dev/exp/ansi
+import sty from github.com/kigumi-dev/exp/style
+import uni from github.com/kigumi-dev/exp/unicode
+
+pure fn typed(i: Input, s: String) -> Input {
+    let mut out = i
+    for c in uni.graphemes(&s) {
+        out = inputStep(out, InputMsg.Put(c))
+    }
+    out
+}
+
+pure fn pressed(i: Input, k: key.Key) -> Input {
+    if inputKey(k) is Some(m) {
+        return inputStep(i, m)
+    }
+    i
+}
+
+pure fn rune(c: Char) -> key.Key {
+    key.Key {
+        code: key.Code.Rune(c)
+        ctrl: false
+        alt: false
+        shift: false
+    }
+}
+
+pure fn named(code: key.Code) -> key.Key {
+    key.Key {
+        code: code
+        ctrl: false
+        alt: false
+        shift: false
+    }
+}
+
+test "a new field puts the caret after its text" {
+    let i = input("abc")
+    test.expectEq(i.caret, 3)?
+    test.expectEq(caretCol(&i), 3)?
+}
+
+test "the caret counts clusters, not scalars" {
+    let i = input("a\u{3042}\u{1f469}\u{200d}\u{1f467}")
+    test.expectEq(i.caret, 3)?
+    // One narrow, one wide, one emoji: 1 + 2 + 2.
+    test.expectEq(caretCol(&i), 5)?
+}
+
+test "a cluster typed one scalar at a time stays one cluster" {
+    // The terminal sends a ZWJ emoji as three separate key presses, so each
+    // one has to join the cluster before it instead of becoming a cell.
+    let i = typed(input(""), "x")
+        |> inputStep(InputMsg.Put("\u{1f469}"))
+        |> inputStep(InputMsg.Put("\u{200d}"))
+        |> inputStep(InputMsg.Put("\u{1f467}"))
+    test.expectEq(i.caret, 2)?
+    test.expectEq(caretCol(&i), 3)?
+    test.expectEq(clusters(&i.text).len().toInt() || 0, 2)?
+}
+
+test "a combining mark joins the letter before it" {
+    let i = input("e")
+        |> inputStep(InputMsg.Put("\u{301}"))
+    test.expectEq(i.caret, 1)?
+    test.expectEq(caretCol(&i), 1)?
+}
+
+test "a paste inserts every cluster it holds" {
+    let i = input("")
+        |> inputStep(InputMsg.Put("abcd"))
+    test.expectEq(i.caret, 4)?
+    test.expectEq(caretCol(&i), 4)?
+    test.expectEq(i.text, "abcd")?
+}
+
+test "backspace removes one cluster, not one byte" {
+    let i = input("a\u{1f469}\u{200d}\u{1f467}")
+        |> inputStep(InputMsg.Erase)
+    test.expectEq(i.text, "a")?
+    test.expectEq(i.caret, 1)?
+}
+
+test "backspace at the start changes nothing" {
+    let i = input("ab")
+        |> inputStep(InputMsg.ToEdge(false))
+        |> inputStep(InputMsg.Erase)
+    test.expectEq(i.text, "ab")?
+    test.expectEq(i.caret, 0)?
+}
+
+test "delete removes the cluster under the caret" {
+    let i = input("a\u{3042}b")
+        |> inputStep(InputMsg.Nudge(-2))
+        |> inputStep(InputMsg.Delete)
+    test.expectEq(i.text, "ab")?
+    test.expectEq(i.caret, 1)?
+}
+
+test "delete at the end changes nothing" {
+    let i = input("ab")
+        |> inputStep(InputMsg.Delete)
+    test.expectEq(i.text, "ab")?
+}
+
+test "typing happens at the caret, not the end" {
+    let i = input("ac")
+        |> inputStep(InputMsg.Nudge(-1))
+        |> inputStep(InputMsg.Put("b"))
+    test.expectEq(i.text, "abc")?
+    test.expectEq(i.caret, 2)?
+}
+
+test "the caret cannot leave the text" {
+    let i = input("ab")
+        |> inputStep(InputMsg.Nudge(-9))
+    test.expectEq(i.caret, 0)?
+    let j = inputStep(i, InputMsg.Nudge(99))
+    test.expectEq(j.caret, 2)?
+}
+
+test "home and end reach both edges" {
+    let i = input("abc")
+        |> inputStep(InputMsg.ToEdge(false))
+    test.expectEq(i.caret, 0)?
+    test.expectEq(inputStep(i, InputMsg.ToEdge(true)).caret, 3)?
+}
+
+test "wipe empties the field" {
+    let i = input("abc")
+        |> inputStep(InputMsg.Wipe)
+    test.expectEq(i.text, "")?
+    test.expectEq(i.caret, 0)?
+}
+
+test "a key becomes the edit it stands for" {
+    let i = pressed(input(""), rune('z'))
+    test.expectEq(i.text, "z")?
+    let j = pressed(i, named(key.Code.Backspace))
+    test.expectEq(j.text, "")?
+}
+
+test "space types a space" {
+    test.expectEq(pressed(input(""), named(key.Code.Space)).text, " ")?
+}
+
+test "ctrl+u wipes and other control keys are declined" {
+    let w = key.Key {
+        code: key.Code.Rune('u')
+        ctrl: true
+        alt: false
+        shift: false
+    }
+    test.expectEq(pressed(input("abc"), w).text, "")?
+    let c = key.Key {
+        code: key.Code.Rune('c')
+        ctrl: true
+        alt: false
+        shift: false
+    }
+    test.expectEq(inputKey(c) is None, true)?
+}
+
+test "tab is not claimed, so focus can still move" {
+    test.expectEq(inputKey(named(key.Code.Tab)) is None, true)?
+}
+
+test "an alt chord is not claimed" {
+    let a = key.Key {
+        code: key.Code.Rune('x')
+        ctrl: false
+        alt: true
+        shift: false
+    }
+    test.expectEq(inputKey(a) is None, true)?
+}
+
+test "the view is exactly as wide as it was asked for" {
+    let i = input("abc")
+    let n = inputView(&i, true, 10, &inputLook())
+    let lines = tui.render(&n, 10, 1, sty.Profile.NoColor)
+    test.expectEq(lines.get(0) || "", "abc       ")?
+}
+
+test "a line longer than the field scrolls to keep the caret visible" {
+    let i = input("abcdefghij")
+    let n = inputView(&i, true, 4, &inputLook())
+    let lines = tui.render(&n, 4, 1, sty.Profile.NoColor)
+    // The caret sits after "j", so the window ends one past it.
+    test.expectEq(lines.get(0) || "", "hij ")?
+    test.expectEq(tui.cursorOf(&n, 4, 1) is Some(tui.Spot {
+        col: 3
+        row: 0
+    }), true)?
+}
+
+test "scrolling back to the start shows the head of the line again" {
+    let i = input("abcdefghij")
+        |> inputStep(InputMsg.ToEdge(false))
+    let n = inputView(&i, true, 4, &inputLook())
+    test.expectEq(tui.render(&n, 4, 1, sty.Profile.NoColor).get(0) || "", "abcd")?
+    test.expectEq(tui.cursorOf(&n, 4, 1) is Some(tui.Spot {
+        col: 0
+        row: 0
+    }), true)?
+}
+
+test "the caret lands past a wide cluster, not inside it" {
+    let i = input("\u{3042}b")
+        |> inputStep(InputMsg.ToEdge(false))
+        |> inputStep(InputMsg.Nudge(1))
+    let n = inputView(&i, true, 6, &inputLook())
+    test.expectEq(tui.cursorOf(&n, 6, 1) is Some(tui.Spot {
+        col: 2
+        row: 0
+    }), true)?
+}
+
+test "an unfocused field shows its placeholder and parks no caret" {
+    let l = InputLook {
+        placeholder: "name"
+        focused: sty.plain()
+        blurred: sty.plain()
+    }
+    let i = input("")
+    let n = inputView(&i, false, 8, &l)
+    test.expectEq(tui.render(&n, 8, 1, sty.Profile.NoColor).get(0) || "", "name    ")?
+    test.expectEq(tui.cursorOf(&n, 8, 1) is None, true)?
+}
+
+test "an unfocused field hears nothing" {
+    let i = input("")
+    let n = inputView(&i, false, 8, &inputLook())
+    test.expectEq(tui.dispatch(n, rune('z')) is None, true)?
+    test.expectEq(tui.dispatchPaste(inputView(&i, false, 8, &inputLook()), "z") is None, true)?
+}
+
+test "a focused field hears a key and a paste" {
+    let i = input("")
+    let n = inputView(&i, true, 8, &inputLook())
+    test.expectEq(tui.dispatch(n, rune('z')) is Some(InputMsg.Put("z")), true)?
+    test.expectEq(tui.dispatchPaste(inputView(&i, true, 8, &inputLook()), "hi") is Some(InputMsg.Put("hi")), true)?
+}
+
+test "a field is one stop of the focus ring" {
+    let i = input("")
+    test.expectEq(tui.focusCount(&inputView(&i, true, 8, &inputLook())), 1)?
+    test.expectEq(tui.focusAt(&inputView(&i, true, 8, &inputLook())) is Some(0), true)?
+    test.expectEq(tui.focusAt(&inputView(&i, false, 8, &inputLook())) is None, true)?
+}

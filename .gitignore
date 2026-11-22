@@ -1,0 +1,8 @@
+# ビルド成果物
+a.out
+a.out.kgabi.json
+*.o
+*.so
+
+# 各自の checkout に依存する local 解決
+mod.local.kg

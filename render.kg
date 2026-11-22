@@ -1,0 +1,379 @@
+import alloc from std/alloc
+import math from std/math
+import text from std/text
+import fit from github.com/kigumi-dev/exp/ansi
+import sty from github.com/kigumi-dev/exp/style
+
+/// Lays the node out in a box of the given size and returns exactly `rows`
+/// lines, each exactly `cols` display cells wide. A box with no room in either
+/// direction returns no lines at all.
+pub pure fn render[M](n: &Node[M], cols: Int, rows: Int, p: sty.Profile) -> Array[String] {
+    if cols <= 0 || rows <= 0 {
+        return Array.empty[String]()
+    }
+    box(draw(n, cols, rows, p), cols, rows)
+}
+
+pure fn draw[M](n: &Node[M], cols: Int, rows: Int, p: sty.Profile) -> Array[String] {
+    match n {
+        Text(s) -> textLines(s, cols)
+        Column(kids) -> drawColumn(kids, cols, rows, p)
+        Row(kids) -> drawRow(kids, cols, rows, p)
+        Fixed(cells, kid) -> drawOnly(kid, cols, rows, p)
+        Flex(weight, kid) -> drawOnly(kid, cols, rows, p)
+        Styled(st, kid) -> paintAll(renderOnly(kid, cols, rows, p), st, p)
+        Bordered(b, edge, kid) -> drawBorder(b, edge, kid, cols, rows, p)
+        OnKey(h, kid) -> drawOnly(kid, cols, rows, p)
+        OnPaste(h, kid) -> drawOnly(kid, cols, rows, p)
+        // Routing is not drawing: a gated subtree draws like an open one.
+        Focus(on, kid) -> drawOnly(kid, cols, rows, p)
+        Inert(kid) -> drawOnly(kid, cols, rows, p)
+        Reserve(names, kid) -> drawOnly(kid, cols, rows, p)
+        Cursor(dx, dy, kid) -> drawOnly(kid, cols, rows, p)
+    }
+}
+
+pure fn drawOnly[M](kid: &alloc.Box[Node[M]], cols: Int, rows: Int, p: sty.Profile) -> Array[String] {
+    kid.with((n: &Node[M]) => draw(n, cols, rows, p))
+}
+
+pure fn renderOnly[M](kid: &alloc.Box[Node[M]], cols: Int, rows: Int, p: sty.Profile) -> Array[String] {
+    kid.with((n: &Node[M]) => render(n, cols, rows, p))
+}
+
+/// Applies the style to each already-fitted line. Per line rather than once
+/// around the block, so a style survives the renderer writing only the rows
+/// that changed.
+pure fn paintAll(lines: Array[String], st: sty.Style, p: sty.Profile) -> Array[String] {
+    if st.isPlain() {
+        return lines
+    }
+    lines.map((l) => st.render(p, l))
+}
+
+pure fn drawBorder[M](b: &sty.Border, edge: &sty.Style, kid: &alloc.Box[Node[M]], cols: Int, rows: Int, p: sty.Profile) -> Array[String] {
+    let slot = inner(cols, rows)
+    if !slot.framed {
+        // No room for the frame; draw the child alone rather than nothing.
+        return renderOnly(kid, cols, rows, p)
+    }
+    let box = renderOnly(kid, slot.cols, slot.rows, p)
+    sty.frame(b, p, edge, &box, slot.cols)
+}
+
+/// What a border leaves for its child: whether there was room to draw a frame
+/// at all, where the child's box starts, and how big it is. `drawBorder` and
+/// `spotIn` have to agree about this or the cursor lands off the picture while
+/// every rendering test still passes, so the rule is written once.
+type Inner = {
+    framed Bool
+    dx Int
+    dy Int
+    cols Int
+    rows Int
+}
+
+pure fn inner(cols: Int, rows: Int) -> Inner {
+    if cols < 2 || rows < 2 {
+        return Inner {
+            framed: false
+            dx: 0
+            dy: 0
+            cols: cols
+            rows: rows
+        }
+    }
+    Inner {
+        framed: true
+        dx: 1
+        dy: 1
+        cols: cols - 2
+        rows: rows - 2
+    }
+}
+
+pure fn textLines(s: &String, cols: Int) -> Array[String] {
+    s.split("\n").map((line: &String) => fit.padRight(&tame(line), cols))
+}
+
+/// Replaces the control characters that move the cursor on their own with a
+/// space, so a line is as wide as it measures. A tab, carriage return or
+/// backspace counts as no cells but the terminal acts on it, which leaves the
+/// row short and shifts every column to its right.
+///
+/// `ESC` survives: an SGR run is how a style reaches the screen, and the width
+/// measurement already skips it.
+pure fn tame(s: &String) -> String {
+    let mut out = text.StringBuilder.new()
+    for c in s.chars() {
+        let n = c.toInt()
+        if n == 0x1b || !(n < 0x20 || n == 0x7f || (n >= 0x80 && n <= 0x9f)) {
+            out.push(text.fromChar(c))
+        } else {
+            out.push(" ")
+        }
+    }
+    out.freeze() || s.concat("")
+}
+
+/// Pads or clips a block to exactly cols x rows.
+pure fn box(lines: Array[String], cols: Int, rows: Int) -> Array[String] {
+    let mut out = Array.empty[String]()
+    let want = rows.toUsize() || 0
+    for i in 0..want {
+        if lines.get(i) is Some(l) {
+            out.push(fit.padRight(&l, cols))
+        } else {
+            out.push(" ".repeat(cols.toUsize() || 0))
+        }
+    }
+    out
+}
+
+/// How much of the main axis each child gets.
+///
+/// Fixed children are clamped to what is left, so a child asking for more rows
+/// than the box has cannot make the renderer lay out rows that do not exist.
+/// The remainder of the weighted division goes to the largest fractional
+/// parts, earliest first; handing it all to one child starves every other
+/// child when the axis is smaller than the child count.
+pure fn shares[M](kids: &Array[Node[M]], total: Int) -> Array[Int] {
+    let mut out = Array.empty[Int]()
+    let mut weightSum = 0
+    let mut left = math.max(0, total)
+    for i in 0..kids.len() {
+        let got = match sizingAt(kids, i) {
+            FixedAt(c) -> math.min(math.max(0, c), left)
+            Weighted(w) -> {
+                weightSum = weightSum + math.max(0, w)
+                0
+            }
+            Auto -> {
+                weightSum = weightSum + 1
+                0
+            }
+        }
+        left = left - got
+        out.push(got)
+    }
+    if weightSum <= 0 || left <= 0 {
+        return out
+    }
+    let spare = left
+    let mut extra = spare
+    let mut rest = Array.empty[Int]()
+    for i in 0..kids.len() {
+        let w = weightAt(kids, i)
+        if w <= 0 {
+            rest.push(-1)
+        } else {
+            let exact = spare * w
+            let got = exact / weightSum
+            let _ = out.withMut(i, (v: &mut Int) => {
+                v = got
+            })
+            extra = extra - got
+            rest.push(exact % weightSum)
+        }
+    }
+    for n in 0..extra {
+        if biggest(&rest) is Some(at) {
+            let _ = out.withMut(at, (v: &mut Int) => {
+                v = v + 1
+            })
+            let _ = rest.withMut(at, (v: &mut Int) => {
+                v = -1
+            })
+        }
+    }
+    out
+}
+
+pure fn sizingAt[M](kids: &Array[Node[M]], i: usize) -> Sizing {
+    kids.with(i, (n: &Node[M]) => sizing(n)) || Sizing.Auto
+}
+
+/// The child's weight along the axis, or 0 when it is not flexible.
+pure fn weightAt[M](kids: &Array[Node[M]], i: usize) -> Int {
+    match sizingAt(kids, i) {
+        FixedAt(c) -> 0
+        Weighted(w) -> math.max(0, w)
+        Auto -> 1
+    }
+}
+
+/// The largest remainder still waiting for a cell, earliest first. A remainder
+/// of -1 marks a child that is not flexible or has already been given one.
+pure fn biggest(rest: &Array[Int]) -> usize? {
+    let mut best = -1
+    let mut at: usize = 0
+    let mut found = false
+    for i in 0..rest.len() {
+        let r = rest.get(i) || -1
+        if r > best {
+            best = r
+            at = i
+            found = true
+        }
+    }
+    if !found || best < 0 {
+        return None
+    }
+    Some(at)
+}
+
+type Sizing =
+    | FixedAt(cells: Int)
+    | Weighted(weight: Int)
+    | Auto
+
+/// Why not a `_ -> Auto` fall-through: a wrapper that forgets to pass its
+/// child's sizing through silently resizes it, which is invisible to every
+/// rendering test. Spelling every variant out makes a new one a compile error
+/// (`E814`) instead.
+pure fn sizing[M](n: &Node[M]) -> Sizing {
+    match n {
+        Fixed(cells, kid) -> Sizing.FixedAt(cells)
+        Flex(weight, kid) -> Sizing.Weighted(weight)
+        Styled(st, kid) -> through(kid)
+        OnKey(h, kid) -> through(kid)
+        OnPaste(h, kid) -> through(kid)
+        Focus(on, kid) -> through(kid)
+        Inert(kid) -> through(kid)
+        Reserve(names, kid) -> through(kid)
+        Cursor(dx, dy, kid) -> through(kid)
+        Text(s) -> Sizing.Auto
+        Column(kids) -> Sizing.Auto
+        Row(kids) -> Sizing.Auto
+        // A border adds a cell on each side, so the child's own sizing is not
+        // the frame's.
+        Bordered(b, edge, kid) -> Sizing.Auto
+    }
+}
+
+/// A wrapper is as big as what it wraps.
+pure fn through[M](kid: &alloc.Box[Node[M]]) -> Sizing {
+    kid.with((n: &Node[M]) => sizing(n))
+}
+
+pure fn drawColumn[M](kids: &Array[Node[M]], cols: Int, rows: Int, p: sty.Profile) -> Array[String] {
+    let heights = shares(kids, rows)
+    let mut out = Array.empty[String]()
+    for i in 0..kids.len() {
+        let h = heights.get(i) || 0
+        if h > 0 {
+            out.appendAll(kids.with(i, (n: &Node[M]) => render(n, cols, h, p)) || Array.empty[String]())
+        }
+    }
+    out
+}
+
+pure fn drawRow[M](kids: &Array[Node[M]], cols: Int, rows: Int, p: sty.Profile) -> Array[String] {
+    let widths = shares(kids, cols)
+    let mut blocks = Array.empty[Array[String]]()
+    for i in 0..kids.len() {
+        let w = widths.get(i) || 0
+        let block = kids.with(i, (n: &Node[M]) => render(n, w, rows, p)) || Array.empty[String]()
+        blocks.push(block)
+    }
+    let mut out = Array.empty[String]()
+    let mut r: usize = 0
+    let want = rows.toUsize() || 0
+    for r < want {
+        let mut line = ""
+        let mut c: usize = 0
+        for c < blocks.len() {
+            let piece = blocks.with(c, (b: &Array[String]) => b.get(r) || "") || ""
+            line = line.concat(piece)
+            c = c + 1
+        }
+        out.push(line)
+        r = r + 1
+    }
+    out
+}
+
+/// A cell of the screen, counted from the top-left corner.
+pub type Spot = {
+    pub col Int
+    pub row Int
+}
+
+/// Where the terminal's cursor goes: the first `Node.Cursor` in view order,
+/// resolved from its subtree's own corner to a cell of the whole screen. None
+/// when the view asks for no cursor, which leaves it hidden.
+///
+/// Why a second pass instead of a field on the frame: `render` returns lines
+/// and nothing else, and 20 geometry tests pin that. The two walks share
+/// `shares` and `inner`, which is where they could otherwise drift.
+pub pure fn cursorOf[M](n: &Node[M], cols: Int, rows: Int) -> Spot? {
+    spotIn(n, 0, 0, cols, rows)
+}
+
+pure fn spotIn[M](n: &Node[M], x: Int, y: Int, cols: Int, rows: Int) -> Spot? {
+    if cols <= 0 || rows <= 0 {
+        return None
+    }
+    match n {
+        Text(s) -> None
+        Column(kids) -> spotColumn(kids, x, y, cols, rows)
+        Row(kids) -> spotRow(kids, x, y, cols, rows)
+        Fixed(cells, kid) -> spotOnly(kid, x, y, cols, rows)
+        Flex(weight, kid) -> spotOnly(kid, x, y, cols, rows)
+        Styled(st, kid) -> spotOnly(kid, x, y, cols, rows)
+        Bordered(b, edge, kid) -> {
+            let slot = inner(cols, rows)
+            spotOnly(kid, x + slot.dx, y + slot.dy, slot.cols, slot.rows)
+        }
+        OnKey(h, kid) -> spotOnly(kid, x, y, cols, rows)
+        OnPaste(h, kid) -> spotOnly(kid, x, y, cols, rows)
+        Reserve(names, kid) -> spotOnly(kid, x, y, cols, rows)
+        // A subtree that cannot hear the keyboard does not get the cursor
+        // either. That is what keeps "one caret on the screen" structural
+        // rather than a rule widget authors have to remember.
+        Focus(on, kid) -> if on {
+            spotOnly(kid, x, y, cols, rows)
+        } else {
+            None
+        }
+        Inert(kid) -> None
+        Cursor(dx, dy, kid) -> Some(Spot {
+            col: x + math.min(math.max(0, dx), cols - 1)
+            row: y + math.min(math.max(0, dy), rows - 1)
+        })
+    }
+}
+
+pure fn spotOnly[M](kid: &alloc.Box[Node[M]], x: Int, y: Int, cols: Int, rows: Int) -> Spot? {
+    kid.with((n: &Node[M]) => spotIn(n, x, y, cols, rows))
+}
+
+pure fn spotColumn[M](kids: &Array[Node[M]], x: Int, y: Int, cols: Int, rows: Int) -> Spot? {
+    let heights = shares(kids, rows)
+    let mut top = y
+    for i in 0..kids.len() {
+        let h = heights.get(i) || 0
+        if h > 0 {
+            if kids.with(i, (n: &Node[M]) => spotIn(n, x, top, cols, h)) is Some(Some(sp)) {
+                return Some(sp)
+            }
+        }
+        top = top + h
+    }
+    None
+}
+
+pure fn spotRow[M](kids: &Array[Node[M]], x: Int, y: Int, cols: Int, rows: Int) -> Spot? {
+    let widths = shares(kids, cols)
+    let mut left = x
+    for i in 0..kids.len() {
+        let w = widths.get(i) || 0
+        if w > 0 {
+            if kids.with(i, (n: &Node[M]) => spotIn(n, left, y, w, rows)) is Some(Some(sp)) {
+                return Some(sp)
+            }
+        }
+        left = left + w
+    }
+    None
+}

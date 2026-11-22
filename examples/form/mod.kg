@@ -1,0 +1,15 @@
+Module {
+    name: "github.com/kigumi-dev/bright-bunny/examples/form"
+    kigumi: "0.1"
+    zig: "0.17.0"
+}
+
+Require {
+    name: "github.com/kigumi-dev/bright-bunny"
+    version: "v0.1.0"
+}
+
+Require {
+    name: "github.com/kigumi-dev/bright-bunny/widgets"
+    version: "v0.1.0"
+}

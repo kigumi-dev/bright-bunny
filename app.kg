@@ -1,0 +1,130 @@
+/// An effect the runtime performs on the app's behalf. Commands are data, not
+/// closures the runtime calls: `update` stays pure because it only describes
+/// what should happen. An effect the runtime does not know is not expressible,
+/// which is the point: nothing can smuggle I/O into `update`.
+///
+/// `Batch` runs its children in order, each child's whole cascade before the
+/// next. There is no separate ordered form because the runtime performs one
+/// effect at a time; a command that waits, waits the loop.
+///
+/// `After` fires once, unlike `Sub.Every`. `Read` answers `None` when the file
+/// cannot be read, `Spawn` `None` when the program cannot be run, so an app
+/// handles failure in `update` like any other message.
+///
+/// `Print` writes outside the alt screen, so the line is still there after the
+/// app quits; the frame is repainted afterwards. `Title` sets the window
+/// title.
+pub type Cmd[M] =
+    | NoCmd
+    | Emit(msg: M)
+    | Batch(cmds: Array[Cmd[M]])
+    | After(ms: i64, tag: pure fn() -> M)
+    | Read(path: String, tag: pure fn(String?) -> M)
+    | Spawn(program: String, args: Array[String], tag: pure fn(Int?) -> M)
+    | Print(text: String)
+    | Title(text: String)
+    | Quit
+
+/// Something the app wants to hear about for as long as the model says so.
+/// The runtime diffs subscriptions against the previous frame, so nothing has
+/// to be torn down by hand.
+pub type Sub[M] =
+    | NoSub
+    | Every(ms: i64, tag: pure fn() -> M)
+    | OnResize(tag: pure fn(Int, Int) -> M)
+    | Subs(subs: Array[Sub[M]])
+
+/// What `update` returns: the next model and what to do about it.
+pub type Step[Model, M] = {
+    pub model Model
+    pub cmd Cmd[M]
+}
+
+/// A view and the model it was built from. `view` takes the model by value and
+/// hands it back, so the runtime can move the model once it has consumed the
+/// node.
+pub type Viewed[Model, M] = {
+    pub node Node[M]
+    pub model Model
+}
+
+/// A subscription tree and the model it was built from. As with `Viewed`, the
+/// model comes back so the runtime can move it after the tree is flattened.
+pub type Sourced[Model, M] = {
+    pub subs Sub[M]
+    pub model Model
+}
+
+/// The four pure functions that make an app.
+pub type App[Model, M] = {
+    pub init pure fn() -> Step[Model, M]
+    pub update pure fn(Model, M) -> Step[Model, M]
+    pub view pure fn(Model) -> Viewed[Model, M]
+    pub subs pure fn(Model) -> Sourced[Model, M]
+}
+
+/// A step that changes nothing else.
+pub pure fn still[Model, M](model: Model) -> Step[Model, M] {
+    Step {
+        model: model
+        cmd: Cmd.NoCmd
+    }
+}
+
+/// Rewrites the messages a command will produce, so a parent can run a child
+/// module's command without the child knowing.
+pure fn mapCmds[A, B](cs: Array[Cmd[A]], f: escaping pure fn(A) -> B) -> Array[Cmd[B]] {
+    let mut out = Array.empty[Cmd[B]]()
+    for c in cs {
+        out.push(mapCmd(c, f))
+    }
+    out
+}
+
+pub pure fn mapCmd[A, B](c: Cmd[A], f: escaping pure fn(A) -> B) -> Cmd[B] {
+    match c {
+        NoCmd -> Cmd.NoCmd
+        Emit(m) -> Cmd.Emit(f(m))
+        Batch(cs) -> Cmd.Batch(mapCmds(cs, f))
+        After(ms, tag) -> Cmd.After(ms, () => f(tag()))
+        Read(path, tag) -> Cmd.Read(path, (text: String?) => f(tag(text)))
+        Spawn(program, args, tag) -> Cmd.Spawn(program, args, (status: Int?) => f(tag(status)))
+        Print(text) -> Cmd.Print(text)
+        Title(text) -> Cmd.Title(text)
+        Quit -> Cmd.Quit
+    }
+}
+
+/// The same for subscriptions.
+pure fn mapSubs[A, B](list: Array[Sub[A]], f: escaping pure fn(A) -> B) -> Array[Sub[B]] {
+    let mut out = Array.empty[Sub[B]]()
+    for s in list {
+        out.push(mapSub(s, f))
+    }
+    out
+}
+
+pub pure fn mapSub[A, B](s: Sub[A], f: escaping pure fn(A) -> B) -> Sub[B] {
+    match s {
+        NoSub -> Sub.NoSub
+        Every(ms, tag) -> Sub.Every(ms, () => f(tag()))
+        OnResize(tag) -> Sub.OnResize((w: Int, h: Int) => f(tag(w, h)))
+        Subs(list) -> Sub.Subs(mapSubs(list, f))
+    }
+}
+
+/// Flattens a subscription tree into the list the runtime services.
+pub pure fn flatten[M](s: &Sub[M]) -> Array[Sub[M]] {
+    match s {
+        NoSub -> Array.empty[Sub[M]]()
+        Every(ms, tag) -> Array.of(Sub.Every(ms, tag))
+        OnResize(tag) -> Array.of(Sub.OnResize(tag))
+        Subs(list) -> {
+            let mut out = Array.empty[Sub[M]]()
+            for i in 0..list.len() {
+                out.appendAll(list.with(i, (x: &Sub[M]) => flatten(x)) || Array.empty[Sub[M]]())
+            }
+            out
+        }
+    }
+}

@@ -1,0 +1,615 @@
+import array from std/array
+import test from std/test
+import text from std/text
+import key from github.com/kigumi-dev/exp/ansi
+import sty from github.com/kigumi-dev/exp/style
+import uni from github.com/kigumi-dev/exp/unicode
+
+// --------------------------------------------------------------- the widget
+// A text field. Nothing here knows the app exists; it is told whether it holds
+// focus and derives every consequence of that from the one Bool.
+type Fld = {
+    text String
+}
+
+type FldMsg =
+    | Press(c: Char)
+    | Chop
+
+pure fn fldUpdate(f: Fld, msg: FldMsg) -> Fld {
+    match msg {
+        Press(c) -> Fld { text: f.text.concat(text.fromChar(c)) }
+        Chop -> Fld { text: if f.text.len() == 0 {
+            ""
+        } else {
+            f.text.sliceBytes(0, f.text.len() - 1) || ""
+        } }
+    }
+}
+
+/// Claims the keys it understands and nothing else, so tab and ctrl+c travel
+/// on to whoever bound them.
+pure fn fldKey(k: key.Key) -> FldMsg? {
+    if k.ctrl || k.alt {
+        return None
+    }
+    match k.code {
+        key.Code.Rune(c) -> Some(FldMsg.Press(c))
+        key.Code.Backspace -> Some(FldMsg.Chop)
+        _ -> None
+    }
+}
+
+pure fn fldView(f: &Fld, label: String, on: Bool) -> Node[FldMsg] {
+    let paint = if on {
+        sty.plain().withReverse(true)
+    } else {
+        sty.plain().withDim(true)
+    }
+    let line: Node[FldMsg] = styled(Node.Text("${label}${f.text}"), paint)
+    // The caret is asked for either way: a stop that is not on cannot park the
+    // cursor, so there is nothing to guard here.
+    let body: Node[FldMsg] = cursorAt(line, uni.stringWidth(&label) + uni.stringWidth(&f.text), 0)
+    focus(onKey(body, fldKey), on)
+}
+
+// ------------------------------------------------------------------ the app
+type Form = {
+    name Fld
+    host Fld
+    on Int
+}
+
+type FormMsg =
+    | Edit(at: Int, m: FldMsg)
+    | Ahead
+    | Astern
+    | Bail
+
+pure fn fmlInit() -> Step[Form, FormMsg] {
+    still(Form {
+        name: Fld { text: "" }
+        host: Fld { text: "" }
+        on: 0
+    })
+}
+
+pure fn fmlUpdate(m: Form, msg: FormMsg) -> Step[Form, FormMsg] {
+    match msg {
+        Edit(at, c) -> if at == 0 {
+            still(Form {
+                ..m
+                name: fldUpdate(m.name, c)
+            })
+        } else {
+            still(Form {
+                ..m
+                host: fldUpdate(m.host, c)
+            })
+        }
+        // The ring is read off the view, so the form never says how many stops
+        // it has and adding a field cannot leave the count behind.
+        Ahead -> {
+            let next = focusStep(&fmlLayout(&m), 1)
+            still(Form {
+                ..m
+                on: next
+            })
+        }
+        Astern -> {
+            let next = focusStep(&fmlLayout(&m), -1)
+            still(Form {
+                ..m
+                on: next
+            })
+        }
+        Bail -> Step {
+            model: m
+            cmd: Cmd.Quit
+        }
+    }
+}
+
+pure fn fmlLayout(m: &Form) -> Node[FormMsg] {
+    column(Array.of[Node[FormMsg]](fixed(mapNode(fldView(&m.name, "name ", m.on == 0), (x: FldMsg) => FormMsg.Edit(0, x)), 1), fixed(mapNode(fldView(&m.host, "host ", m.on == 1), (x: FldMsg) => FormMsg.Edit(1, x)), 1), flex(empty[FormMsg](), 1)))
+        |> reserve(Array.of[String]("tab", "shift+tab", "ctrl+c"))
+        |> onKeyName("tab", FormMsg.Ahead)
+        |> onKeyName("shift+tab", FormMsg.Astern)
+        |> onKeyName("ctrl+c", FormMsg.Bail)
+}
+
+pure fn fmlView(m: Form) -> Viewed[Form, FormMsg] {
+    Viewed {
+        node: fmlLayout(&m)
+        model: m
+    }
+}
+
+pure fn fmlSubs(m: Form) -> Sourced[Form, FormMsg] {
+    Sourced {
+        subs: Sub.NoSub
+        model: m
+    }
+}
+
+fn fmlApp() -> App[Form, FormMsg] {
+    App {
+        init: fmlInit
+        update: fmlUpdate
+        view: fmlView
+        subs: fmlSubs
+    }
+}
+
+// ------------------------------------------------------------------ helpers
+fn fmlBytes(items: ...String) -> Array[Bytes] {
+    let mut out = Array.empty[Bytes]()
+    for s in items {
+        out.push(s.toBytes())
+    }
+    out
+}
+
+pure fn fmlAt(on: Int) -> Form {
+    Form {
+        name: Fld { text: "" }
+        host: Fld { text: "" }
+        on: on
+    }
+}
+
+/// A widget that claims every key it is offered. The difference between asking
+/// a subtree and pruning it is only visible against one of these.
+pure fn fmlGreedy(on: Bool) -> Node[FormMsg] {
+    // Both handlers go inside the gate. A handler wrapped around `focus`
+    // instead of inside it is outside the gate and still hears everything --
+    // which is why a widget gates itself rather than being gated from above.
+    let body: Node[FormMsg] = Node.Text("grab")
+        |> onKey((k: key.Key) => Some(FormMsg.Edit(9, FldMsg.Chop)))
+        |> onPaste((t: String) => Some(FormMsg.Edit(8, FldMsg.Chop)))
+    focus(body, on)
+}
+
+pure fn fmlClaimed() -> Node[FormMsg] {
+    fmlGreedy(true)
+        |> reserve(Array.of[String]("tab"))
+        |> onKeyName("tab", FormMsg.Ahead)
+}
+
+pure fn fmlWhich(n: Node[FormMsg], k: key.Key) -> Int {
+    if dispatch(n, k) is Some(FormMsg.Edit(at, _)) {
+        return at
+    }
+    -1
+}
+
+// -------------------------------------------------------------------- tests
+test "the model alone says which stop is focused" {
+    test.expectEq(focusAt(&fmlLayout(&fmlAt(0))) is Some(0), true)?
+    test.expectEq(focusAt(&fmlLayout(&fmlAt(1))) is Some(1), true)?
+    test.expectEq(focusAt(&fmlLayout(&fmlAt(7))) is None, true)?
+}
+
+test "the ring is counted off the view" {
+    test.expectEq(focusCount(&fmlLayout(&fmlAt(0))), 2)?
+}
+
+test "only the focused stop hears a key" {
+    test.expectEq(fmlWhich(fmlLayout(&fmlAt(0)), key.plain(key.Code.Rune('z'))), 0)?
+    test.expectEq(fmlWhich(fmlLayout(&fmlAt(1)), key.plain(key.Code.Rune('z'))), 1)?
+}
+
+test "an unfocused stop is pruned, not asked" {
+    let n: Node[FormMsg] = column(Array.of[Node[FormMsg]](fmlGreedy(false), fmlGreedy(true)))
+    // Both would claim the key. The first is never offered it.
+    test.expectEq(dispatch(n, key.plain(key.Code.Rune('z'))) is Some(_), true)?
+    let deaf: Node[FormMsg] = column(Array.of[Node[FormMsg]](fmlGreedy(false)))
+    test.expectEq(dispatch(deaf, key.plain(key.Code.Rune('z'))) is None, true)?
+}
+
+test "a key no widget understands reaches the app's own binding" {
+    test.expectEq(dispatch(fmlLayout(&fmlAt(0)), key.plain(key.Code.Tab)) is Some(FormMsg.Ahead), true)?
+}
+
+test "a reserved key beats a greedy focused widget" {
+    // Everything else still reaches the widget.
+    test.expectEq(fmlWhich(fmlClaimed(), key.plain(key.Code.Rune('z'))), 9)?
+    test.expectEq(dispatch(fmlClaimed(), key.plain(key.Code.Tab)) is Some(FormMsg.Ahead), true)?
+}
+
+test "without the reserve the greedy widget wins" {
+    let open: Node[FormMsg] = fmlGreedy(true)
+        |> onKeyName("tab", FormMsg.Ahead)
+    test.expectEq(fmlWhich(open, key.plain(key.Code.Tab)), 9)?
+}
+
+test "a reserve does not block a paste" {
+    let n: Node[FormMsg] = fmlGreedy(true)
+        |> reserve(Array.of[String]("tab"))
+    test.expectEq(dispatchPaste(n, "hi") is Some(_), true)?
+}
+
+test "a paste reaches the focused stop only" {
+    let n: Node[FormMsg] = column(Array.of[Node[FormMsg]](fmlGreedy(false), fmlGreedy(true)))
+    test.expectEq(dispatchPaste(n, "hi") is Some(_), true)?
+    let deaf: Node[FormMsg] = column(Array.of[Node[FormMsg]](fmlGreedy(false)))
+    test.expectEq(dispatchPaste(deaf, "hi") is None, true)?
+}
+
+test "an inert subtree hears neither key nor paste" {
+    test.expectEq(dispatchPaste(inert(fmlGreedy(true)), "hi") is None, true)?
+    test.expectEq(dispatch(inert(fmlGreedy(true)), key.plain(key.Code.Rune('z'))) is None, true)?
+}
+
+test "tab walks the ring and wraps" {
+    test.expectEq(focusStep(&fmlLayout(&fmlAt(0)), 1), 1)?
+    test.expectEq(focusStep(&fmlLayout(&fmlAt(1)), 1), 0)?
+}
+
+test "shift+tab walks the ring backwards and wraps" {
+    test.expectEq(focusStep(&fmlLayout(&fmlAt(1)), -1), 0)?
+    test.expectEq(focusStep(&fmlLayout(&fmlAt(0)), -1), 1)?
+}
+
+test "nothing focused means entering the ring from the edge it came from" {
+    test.expectEq(focusStep(&fmlLayout(&fmlAt(7)), 1), 0)?
+    test.expectEq(focusStep(&fmlLayout(&fmlAt(7)), -1), 1)?
+}
+
+test "an empty ring answers without trapping anything" {
+    let n: Node[FormMsg] = Node.Text("nothing here")
+    test.expectEq(focusCount(&n), 0)?
+    test.expectEq(focusStep(&n, 1), 0)?
+    test.expectEq(focusClamp(&n, 4), 0)?
+}
+
+test "a stale index is pulled back into the ring" {
+    test.expectEq(focusClamp(&fmlLayout(&fmlAt(7)), 7), 1)?
+    test.expectEq(focusClamp(&fmlLayout(&fmlAt(0)), 1), 1)?
+}
+
+// ------------------------------------------------------- a composite widget
+// A pair of fields with a ring of its own. It takes `focused` and threads it
+// into its children, so a blurred section's own highlight goes dark with it.
+type Pair = {
+    one Fld
+    two Fld
+    on Int
+}
+
+type PairMsg =
+    | First(m: FldMsg)
+    | Second(m: FldMsg)
+
+pure fn pairView(p: &Pair, on: Bool) -> Node[PairMsg] {
+    let rows: Node[PairMsg] = column(Array.of[Node[PairMsg]](fixed(mapNode(fldView(&p.one, "L ", on && p.on == 0), (x: FldMsg) => PairMsg.First(x)), 1), fixed(mapNode(fldView(&p.two, "R ", on && p.on == 1), (x: FldMsg) => PairMsg.Second(x)), 1)))
+    focus(rows, on)
+}
+
+type Both = {
+    pair Pair
+    solo Fld
+    on Int
+}
+
+type BothMsg =
+    | ToPair(m: PairMsg)
+    | ToSolo(m: FldMsg)
+
+pure fn bothView(m: &Both) -> Node[BothMsg] {
+    column(Array.of[Node[BothMsg]](fixed(mapNode(pairView(&m.pair, m.on == 0), (x: PairMsg) => BothMsg.ToPair(x)), 2), fixed(mapNode(fldView(&m.solo, "S ", m.on == 1), (x: FldMsg) => BothMsg.ToSolo(x)), 1)))
+}
+
+pure fn bothAt(outer: Int, inner: Int) -> Both {
+    Both {
+        pair: Pair {
+            one: Fld { text: "" }
+            two: Fld { text: "" }
+            on: inner
+        }
+        solo: Fld { text: "" }
+        on: outer
+    }
+}
+
+pure fn fmlWith(on: Int, name: String, host: String) -> Form {
+    Form {
+        name: Fld { text: name }
+        host: Fld { text: host }
+        on: on
+    }
+}
+
+pure fn fmlDeaf(k: key.Key) -> FormMsg? {
+    None
+}
+
+pure fn bareView(m: Form) -> Viewed[Form, FormMsg] {
+    Viewed {
+        node: Node.Text("bare")
+            |> onKeyName("q", FormMsg.Bail)
+        model: m
+    }
+}
+
+/// Asks for the cursor only while the field is empty, so the loop has to hide
+/// it again.
+pure fn blinkView(m: Form) -> Viewed[Form, FormMsg] {
+    let node: Node[FormMsg] = mapNode(fldView(&m.name, "n ", m.name.text.len() == 0), (x: FldMsg) => FormMsg.Edit(0, x))
+        |> onKeyName("ctrl+c", FormMsg.Bail)
+    Viewed {
+        node: node
+        model: m
+    }
+}
+
+pure fn grabView(m: Form) -> Viewed[Form, FormMsg] {
+    let node: Node[FormMsg] = fmlGreedy(true)
+        |> reserve(Array.of[String]("ctrl+c"))
+        |> onKeyName("ctrl+c", FormMsg.Bail)
+    Viewed {
+        node: node
+        model: m
+    }
+}
+
+fn fmlAppWith(view: escaping pure fn(Form) -> Viewed[Form, FormMsg]) -> App[Form, FormMsg] {
+    App {
+        init: fmlInit
+        update: fmlUpdate
+        view: view
+        subs: fmlSubs
+    }
+}
+
+// ------------------------------------------------------------ the highlight
+test "the focused stop is the only one drawn as focused" {
+    let out = render(&fmlLayout(&fmlAt(0)), 20, 4, sty.Profile.Basic16)
+    test.expectEq((out.get(0) || "").contains("\u{1b}[7m"), true)?
+    test.expectEq((out.get(1) || "").contains("\u{1b}[7m"), false)?
+    test.expectEq((out.get(1) || "").contains("\u{1b}[2m"), true)?
+}
+
+test "gating a subtree does not move anything on the screen" {
+    let open: Node[FormMsg] = column(Array.of[Node[FormMsg]](fixed(Node.Text("a"), 2), flex(Node.Text("b"), 1)))
+    let gated: Node[FormMsg] = column(Array.of[Node[FormMsg]](fixed(Node.Text("a"), 2) |> focus(false) |> reserve(Array.of[String]("tab")), inert(cursorAt(flex(Node.Text("b"), 1), 0, 0))))
+    let a = render(&open, 4, 5, sty.Profile.NoColor)
+    let b = render(&gated, 4, 5, sty.Profile.NoColor)
+    test.expectEq(array.join(&a, "|"), array.join(&b, "|"))?
+}
+
+test "a handler no longer eats its child's sizing" {
+    // `onKey(fixed(x, 1))` used to fall through to `Auto` and lose the row.
+    let n: Node[FormMsg] = column(Array.of[Node[FormMsg]](onKey(fixed(Node.Text("a"), 1), fmlDeaf), flex(Node.Text("b"), 1)))
+    let out = render(&n, 3, 4, sty.Profile.NoColor)
+    test.expectEq(out.get(0) || "", "a  ")?
+    test.expectEq(out.get(1) || "", "b  ")?
+}
+
+// ---------------------------------------------------------------- the caret
+test "the caret lands in the focused field" {
+    if cursorOf(&fmlLayout(&fmlWith(0, "ab", "")), 40, 4) is Some(sp) {
+        test.expectEq(sp.row, 0)?
+        test.expectEq(sp.col, 7)?
+    } else {
+        test.expectEq("no caret", "a caret")?
+    }
+    if cursorOf(&fmlLayout(&fmlWith(1, "ab", "xyz")), 40, 4) is Some(sp) {
+        test.expectEq(sp.row, 1)?
+        test.expectEq(sp.col, 8)?
+    } else {
+        test.expectEq("no caret", "a caret")?
+    }
+}
+
+test "no focused stop means no caret" {
+    test.expectEq(cursorOf(&fmlLayout(&fmlAt(7)), 40, 4) is None, true)?
+}
+
+test "an unfocused stop cannot park the cursor even when it asks" {
+    let f = Fld { text: "zz" }
+    let n: Node[FldMsg] = fldView(&f, "x ", false)
+    test.expectEq(cursorOf(&n, 20, 1) is None, true)?
+}
+
+test "the caret is resolved through borders and rows" {
+    let f = Fld { text: "ab" }
+    let inner: Node[FldMsg] = row(Array.of[Node[FldMsg]](fixed(Node.Text("|"), 4), flex(fldView(&f, "", true), 1)))
+    let n: Node[FldMsg] = bordered(column(Array.of[Node[FldMsg]](fixed(Node.Text("title"), 1), fixed(inner, 1))), sty.rounded(), sty.plain())
+    if cursorOf(&n, 20, 6) is Some(sp) {
+        // One for the frame, one row for the title, four cells for the gutter,
+        // two for the text.
+        test.expectEq(sp.row, 2)?
+        test.expectEq(sp.col, 7)?
+    } else {
+        test.expectEq("no caret", "a caret")?
+    }
+}
+
+test "a caret asking outside its own box is pulled back into it" {
+    let n: Node[FldMsg] = cursorAt(Node.Text("x"), 99, 99)
+    if cursorOf(&n, 10, 3) is Some(sp) {
+        test.expectEq(sp.col, 9)?
+        test.expectEq(sp.row, 2)?
+    } else {
+        test.expectEq("no caret", "a caret")?
+    }
+}
+
+// --------------------------------------------------------- mapNode and rings
+test "two identical widgets in one view are two different stops" {
+    let a = Fld { text: "same" }
+    let b = Fld { text: "same" }
+    let twin: Node[FormMsg] = column(Array.of[Node[FormMsg]](fixed(mapNode(fldView(&a, "x ", false), (y: FldMsg) => FormMsg.Edit(0, y)), 1), fixed(mapNode(fldView(&b, "x ", true), (y: FldMsg) => FormMsg.Edit(1, y)), 1)))
+    test.expectEq(focusCount(&twin), 2)?
+    test.expectEq(focusAt(&twin) is Some(1), true)?
+    test.expectEq(fmlWhich(twin, key.plain(key.Code.Rune('z'))), 1)?
+}
+
+test "a nested ring is one stop of its parent's" {
+    test.expectEq(focusCount(&bothView(&bothAt(0, 1))), 2)?
+    test.expectEq(focusAt(&bothView(&bothAt(1, 0))) is Some(1), true)?
+}
+
+test "a key reaches the right field through two maps" {
+    let z = key.plain(key.Code.Rune('z'))
+    test.expectEq(dispatch(bothView(&bothAt(0, 1)), z) is Some(BothMsg.ToPair(PairMsg.Second(_))), true)?
+    test.expectEq(dispatch(bothView(&bothAt(0, 0)), z) is Some(BothMsg.ToPair(PairMsg.First(_))), true)?
+    test.expectEq(dispatch(bothView(&bothAt(1, 0)), z) is Some(BothMsg.ToSolo(_)), true)?
+}
+
+test "a blurred section goes dark all the way down" {
+    let out = render(&bothView(&bothAt(1, 0)), 20, 3, sty.Profile.Basic16)
+    // The pair's own cursor still points at its first field, but the section
+    // is not focused, so nothing inside it is lit and the caret is elsewhere.
+    test.expectEq((out.get(0) || "").contains("\u{1b}[7m"), false)?
+    test.expectEq((out.get(2) || "").contains("\u{1b}[7m"), true)?
+    if cursorOf(&bothView(&bothAt(1, 0)), 20, 3) is Some(sp) {
+        test.expectEq(sp.row, 2)?
+    } else {
+        test.expectEq("no caret", "a caret")?
+    }
+}
+
+test "an inert background leaves the ring and the modal keeps it" {
+    let m = fmlAt(0)
+    let modal: Node[FormMsg] = column(Array.of[Node[FormMsg]](fixed(inert(mapNode(fldView(&m.name, "name ", true), (x: FldMsg) => FormMsg.Edit(0, x))), 1), fixed(mapNode(fldView(&m.host, "host ", true), (x: FldMsg) => FormMsg.Edit(1, x)), 1)))
+    test.expectEq(focusCount(&modal), 1)?
+    // Tab cannot leave the modal: there is one stop and it wraps onto itself.
+    test.expectEq(focusStep(&modal, 1), 0)?
+    test.expectEq(fmlWhich(modal, key.plain(key.Code.Rune('z'))), 1)?
+}
+
+// ----------------------------------------------------------------- the loop
+test "tab moves focus and the next keys go to the next field" {
+    let s = script(40, 4, fmlBytes("ab", "\t", "cd", "\u{3}"), 1)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, fmlAppWith(fmlView))?
+    let w = array.join(&s.writes(), "")
+    test.expectEq(w.contains("name ab"), true)?
+    test.expectEq(w.contains("host cd"), true)?
+    // The gate held: nothing reached the first field after the tab.
+    test.expectEq(w.contains("name abcd"), false)?
+}
+
+test "shift+tab off the wire walks the ring backwards" {
+    let s = script(40, 4, fmlBytes("\u{1b}[Z", "q", "\u{3}"), 1)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, fmlAppWith(fmlView))?
+    let w = array.join(&s.writes(), "")
+    test.expectEq(w.contains("host q"), true)?
+}
+
+test "the loop parks the terminal cursor on the focused field" {
+    let s = script(40, 4, fmlBytes("ab", "\u{3}"), 1)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, fmlAppWith(fmlView))?
+    let w = array.join(&s.writes(), "")
+    // Row 0, column 7: five cells of label and two typed.
+    test.expectEq(w.contains("\u{1b}[1;8H"), true)?
+    test.expectEq(w.contains("\u{1b}[?25h"), true)?
+}
+
+test "the cursor is turned on once, not on every frame" {
+    let s = script(40, 4, fmlBytes("a", "b", "c", "\u{3}"), 1)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, fmlAppWith(fmlView))?
+    let mut shown = 0
+    for w in s.writes() {
+        if w.contains("\u{1b}[?25h") {
+            shown = shown + 1
+        }
+    }
+    test.expectEq(shown, 1)?
+}
+
+test "a view that asks for no cursor writes no cursor escape at all" {
+    let s = script(10, 2, fmlBytes("q"), 1)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, fmlAppWith(bareView))?
+    test.expectEq(array.join(&s.writes(), "").contains("\u{1b}[?25"), false)?
+}
+
+test "the cursor is hidden again when the view stops asking for it" {
+    let s = script(20, 2, fmlBytes("a", "\u{3}"), 1)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, fmlAppWith(blinkView))?
+    test.expectEq(array.join(&s.writes(), "").contains("\u{1b}[?25l"), true)?
+}
+
+test "a reserved shortcut quits an app whose widget claims every key" {
+    let s = script(20, 2, fmlBytes("zzz", "\u{3}"), 1)
+    // The safety net is there so a regression fails instead of hanging.
+    s.interruptAfter(9)
+    let _ = runWith(s.clone(), sty.Profile.NoColor, fmlAppWith(grabView))?
+    test.expectEq(s.reads() <= 3, true)?
+}
+
+// ------------------------------------------------- a ring computed from data
+type Lst = {
+    items Array[String]
+    on Int
+}
+
+pure fn lstView(m: &Lst) -> Node[FormMsg] {
+    let mut rows = Array.empty[Node[FormMsg]]()
+    for i in 0..m.items.len() {
+        let at = i.toInt() || 0
+        let label = m.items.with(i, (s: &String) => s.concat("")) || ""
+        let line: Node[FormMsg] = Node.Text(label)
+            |> onKey((k: key.Key) => Some(FormMsg.Edit(at, FldMsg.Chop)))
+        rows.push(fixed(focus(line, m.on == at), 1))
+    }
+    column(rows)
+}
+
+pure fn lstOf(on: Int, items: Array[String]) -> Lst {
+    Lst {
+        items: items
+        on: on
+    }
+}
+
+test "a ring the view computes from data needs no count in the app" {
+    let three = lstOf(2, Array.of[String]("a", "b", "c"))
+    test.expectEq(focusCount(&lstView(&three)), 3)?
+    test.expectEq(fmlWhich(lstView(&three), key.plain(key.Code.Rune('z'))), 2)?
+    // Tab wraps at three without the app ever saying "three".
+    test.expectEq(focusStep(&lstView(&three), 1), 0)?
+}
+
+test "a list that shrank under focus recovers" {
+    let two = lstOf(2, Array.of[String]("a", "b"))
+    // Nothing is on, so nothing hears the key.
+    test.expectEq(dispatch(lstView(&two), key.plain(key.Code.Rune('z'))) is None, true)?
+    // Either pull it back where the model shrank, or let the next tab do it.
+    test.expectEq(focusClamp(&lstView(&two), 2), 1)?
+    test.expectEq(focusStep(&lstView(&two), 1), 0)?
+}
+
+test "two stops on is the app's bug and the first one wins" {
+    let a = Fld { text: "a" }
+    let b = Fld { text: "b" }
+    let n: Node[FldMsg] = column(Array.of[Node[FldMsg]](fixed(fldView(&a, "", true), 1), fixed(fldView(&b, "", true), 1)))
+    test.expectEq(focusCount(&n), 2)?
+    test.expectEq(focusAt(&n) is Some(0), true)?
+    if cursorOf(&n, 10, 2) is Some(sp) {
+        test.expectEq(sp.row, 0)?
+    } else {
+        test.expectEq("no caret", "a caret")?
+    }
+}
+
+/// Three rows whose middle one is disabled: it still draws, it is deaf, and it
+/// is not a stop. That is the whole of "this target declines focus".
+pure fn skipView(on: Int) -> Node[FormMsg] {
+    let one: Node[FormMsg] = Node.Text("one")
+        |> onKey((k: key.Key) => Some(FormMsg.Edit(0, FldMsg.Chop)))
+    let off: Node[FormMsg] = Node.Text("off")
+        |> onKey((k: key.Key) => Some(FormMsg.Edit(1, FldMsg.Chop)))
+    let two: Node[FormMsg] = Node.Text("two")
+        |> onKey((k: key.Key) => Some(FormMsg.Edit(2, FldMsg.Chop)))
+    column(Array.of[Node[FormMsg]](fixed(focus(one, on == 0), 1), fixed(inert(off), 1), fixed(focus(two, on == 1), 1)))
+}
+
+test "a target the view does not offer declines focus by construction" {
+    test.expectEq(focusCount(&skipView(0)), 2)?
+    test.expectEq(focusStep(&skipView(0), 1), 1)?
+    // The second stop is the third row: an ordinal counts stops, not rows.
+    test.expectEq(fmlWhich(skipView(1), key.plain(key.Code.Rune('z'))), 2)?
+    test.expectEq(render(&skipView(0), 5, 3, sty.Profile.NoColor).get(1) || "", "off  ")?
+}
