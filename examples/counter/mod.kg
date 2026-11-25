@@ -6,5 +6,5 @@ Module {
 
 Require {
     name: "github.com/kigumi-dev/bright-bunny"
-    version: "v0.1.0"
+    version: "4ba6c3c073a0ea4d9fb200936c0c85134cca1f0b"
 }
