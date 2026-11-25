@@ -169,21 +169,18 @@ pure fn shares[M](kids: &Array[Node[M]], total: Int) -> Array[Int] {
         } else {
             let exact = spare * w
             let got = exact / weightSum
-            let _ = out.withMut(i, (v: &mut Int) => {
-                v = got
-            })
+            let _ = out.takeAt(i)
+            let _ = out.insertAt(i, got)
             extra = extra - got
             rest.push(exact % weightSum)
         }
     }
     for n in 0..extra {
         if biggest(&rest) is Some(at) {
-            let _ = out.withMut(at, (v: &mut Int) => {
-                v = v + 1
-            })
-            let _ = rest.withMut(at, (v: &mut Int) => {
-                v = -1
-            })
+            let old = out.takeAt(at) || 0
+            let _ = out.insertAt(at, old + 1)
+            let _ = rest.takeAt(at)
+            let _ = rest.insertAt(at, -1)
         }
     }
     out
