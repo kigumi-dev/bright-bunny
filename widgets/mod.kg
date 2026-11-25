@@ -5,20 +5,20 @@ Module {
 
 Require {
     name: "github.com/kigumi-dev/bright-bunny"
-    version: "v0.1.0"
+    version: "4ba6c3c073a0ea4d9fb200936c0c85134cca1f0b"
 }
 
 Require {
     name: "github.com/kigumi-dev/exp/ansi"
-    version: "v0.1.0"
+    version: "6aaacde89c75dc5be97fb4834430fe8e9d395784"
 }
 
 Require {
     name: "github.com/kigumi-dev/exp/style"
-    version: "v0.1.0"
+    version: "01600316bd64f6aaf28f4fb79864fb79fe458c93"
 }
 
 Require {
     name: "github.com/kigumi-dev/exp/unicode"
-    version: "v0.1.0"
+    version: "7b7a5fc7b7329386d72749a65400404743000ba2"
 }
